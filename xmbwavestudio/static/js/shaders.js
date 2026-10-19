@@ -10,6 +10,7 @@ varying vec2 vUv;
 uniform vec2 uResolution;
 uniform vec3 uBase, uBackground, uWave, uAccent;
 uniform float uPhase, uRotation, uHeight, uWidth, uOverlap, uScale, uGlow;
+uniform float uLayerMotion;
 uniform vec2 uOffset;
 uniform int uStyle;
 const float PI = 3.141592653589793;
@@ -107,38 +108,67 @@ vec3 original(vec2 p, vec3 backdrop) {
   return color;
 }
 
+vec3 ps3Layer(float x, int i) {
+  float f=float(i);
+  float amplitude=uHeight/.55;
+  // Every sheet shares the rightward carrier, but its lead/lag changes over
+  // time. Fixed offsets alone would still translate the whole stack rigidly.
+  float q=3.687*x-uPhase-.064;
+  if(uLayerMotion>0.0) {
+    float a=i==0?.045:(i==1?.18:(i==2?.09:.22));
+    float b=i==0?.015:(i==1?.055:(i==2?.025:.06));
+    float alpha=.35+f*1.7,beta=f*1.13-.6;
+    float drift=a*(sin(uPhase+alpha)-sin(alpha))
+               +b*(sin(2.0*uPhase+beta)-sin(beta));
+    // At strength 2, |d(drift)/d(phase)| <= 2*(.22+2*.06)=.68 < 1:
+    // the carrier never reverses. Integer harmonics close both position and
+    // velocity, and subtracting the initial value preserves the initial pose.
+    q-=uLayerMotion*drift;
+  }
+  float ridge=.0067+uHeight*.0888*cos(q)+.0069*x;
+  float edgeA,edgeB;
+  // Broad trailing sheet, pinching front fold, upper veil, crossing middle fold.
+  if(i==0) {
+    edgeA=ridge+amplitude*.004*sin(2.0*q+.8);
+    edgeB=ridge-amplitude*(.035+.09*(.5+.5*cos(q+1.3)));
+  } else if(i==1) {
+    float front=.0067+uHeight*.110*cos(q-.60)+.0069*x;
+    edgeA=front+amplitude*.012*sin(q+.55);
+    edgeB=front+amplitude*(-.013+.036*sin(q+.7));
+  } else if(i==2) {
+    edgeA=ridge+amplitude*(.020+.020*cos(q+.45));
+    edgeB=ridge+amplitude*(.006+.015*sin(q+1.9));
+  } else {
+    float middle=.0067+uHeight*.130*cos(q+.70)+.0069*x;
+    edgeA=middle+amplitude*(-.021+.024*sin(q+1.25));
+    edgeB=middle+amplitude*(-.006+.017*sin(2.0*q-.9));
+  }
+  if(uLayerMotion>0.0) {
+    float alpha=.8+f*1.35;
+    float roll=sin(uPhase+alpha)-sin(alpha);
+    float second=sin(2.0*uPhase+f*.9)-sin(f*.9);
+    float bend=amplitude*uLayerMotion*(.003+.0015*f)
+              *(roll*sin(q+.7*f)+.3*second*sin(2.0*q-.4*f));
+    float center=(edgeA+edgeB)*.5;
+    // Breathing stays within 18% at maximum strength. Signed half-width lets
+    // a thin sheet turn over smoothly without changing its shared centre band.
+    float halfWidth=(edgeA-edgeB)*.5*(1.0+.045*uLayerMotion*roll);
+    edgeA=center+halfWidth+bend;
+    edgeB=center-halfWidth+bend;
+  }
+  float separation=(f-1.5)*(.82-uOverlap)*.055;
+  return vec3(edgeA+separation,edgeB+separation,
+              q+(i==1?-.60:(i==3?.70:0.0)));
+}
+
 vec3 ps3(vec2 p) {
   float x = p.x / uWidth;
   vec3 light = vec3(0.0);
-  float amplitude=uHeight/.55;
-  // A travelling phase carries crests, pinches and reflections to the right.
-  // The reference ridge fit spans 5.29 radians per default screen width and
-  // advances .52 radians/second (about a 12-second natural period).
-  float q=3.687*x-uPhase-.064;
-  float ridge=.0067+uHeight*.0888*cos(q)+.0069*x;
   float incident=0.0,incidentSquares=0.0;
   for (int i=0; i<4; i++) {
     float f = float(i);
-    float edgeA,edgeB;
-    // A broad trailing sheet, a pinching front fold, a faint upper veil, and
-    // a crossing middle fold. Every edge uses the same advected phase.
-    if(i==0) {
-      edgeA=ridge+amplitude*.004*sin(2.0*q+.8);
-      edgeB=ridge-amplitude*(.035+.09*(.5+.5*cos(q+1.3)));
-    } else if(i==1) {
-      float front=.0067+uHeight*.110*cos(q-.60)+.0069*x;
-      edgeA=front+amplitude*.012*sin(q+.55);
-      edgeB=front+amplitude*(-.013+.036*sin(q+.7));
-    } else if(i==2) {
-      edgeA=ridge+amplitude*(.020+.020*cos(q+.45));
-      edgeB=ridge+amplitude*(.006+.015*sin(q+1.9));
-    } else {
-      float middle=.0067+uHeight*.130*cos(q+.70)+.0069*x;
-      edgeA=middle+amplitude*(-.021+.024*sin(q+1.25));
-      edgeB=middle+amplitude*(-.006+.017*sin(2.0*q-.9));
-    }
-    float separation=(f-1.5)*(.82-uOverlap)*.055;
-    edgeA+=separation;edgeB+=separation;
+    vec3 layer=ps3Layer(x,i);
+    float edgeA=layer.x,edgeB=layer.y;
     float center=(edgeA+edgeB)*.5;
     float lo=min(edgeA,edgeB),hi=max(edgeA,edgeB);
     float blur=max(fwidth(p.y)*.75,.0032+f*.0005);
@@ -148,7 +178,7 @@ vec3 ps3(vec2 p) {
     float density=i==0?.22:(i==3?.045:.025);
     float backLight=i==0?.04*pow(1.0-facing,2.0):0.0;
     float volume=sheet*(.012+density*pow(facing,1.45)+backLight);
-    float orientation=q+(i==1?-.60:(i==3?.70:0.0));
+    float orientation=layer.z;
     float rim=gaussian(p.y-edgeA,blur*1.2)*.10*(i==0?1.25:.8);
     float fold=gaussian(p.y-edgeB,blur*1.8)*.030;
     float haze=gaussian(p.y-center,abs(edgeA-edgeB)+.025)*.006;

@@ -42,6 +42,118 @@ def inspect_video(path, expected_size, fps, duration):
     return first, metadata
 
 
+def check_layer_motion(page, channel):
+    result = page.evaluate("""async()=>{
+      const {WaveRenderer}=await import('/static/js/renderer.js');
+      const {waveFragment}=await import('/static/js/shaders.js');
+      const {DEFAULT_SCENE}=await import('/static/js/scene.js');
+      const r=new WaveRenderer(),size={width:256,height:144};
+      const config={...DEFAULT_SCENE,particle_count:0,speed:1};
+      const loops=[],stopped=[];
+      for(const layer_motion of [0,1,2]) {
+        const c={...config,layer_motion};
+        for(const duration of [1,10,12])for(const fps of [30,60]) {
+          r.renderAt(c,0,size,duration);const first=r.readPixels().slice();
+          r.renderAt(c,duration,size,duration);const end=r.readPixels().slice();
+          const endpoint=first.every((v,i)=>v===end[i]);
+          r.renderAt(c,1/fps,size,duration);const after=r.readPixels().slice();
+          r.renderAt(c,duration-1/fps,size,duration);const before=r.readPixels().slice();
+          let jerk=0,movement=0;
+          for(let i=0;i<first.length;i++){
+            jerk+=Math.abs(after[i]+before[i]-2*first[i]);
+            movement+=Math.abs(after[i]-before[i]);
+          }
+          loops.push({layer_motion,duration,fps,endpoint,
+            jerk:jerk/first.length,movement:movement/first.length});
+        }
+        r.renderAt({...c,speed:0},0,size,10);const a=r.readPixels().slice();
+        r.renderAt({...c,speed:0},4,size,10);
+        const b=r.readPixels();stopped.push(a.every((v,i)=>v===b[i]));
+      }
+      // Observe the production sheet edges on the GPU, in a coordinate frame
+      // travelling with the carrier. No duplicate JavaScript geometry model.
+      // Pack each edge into 16 bits so subpixel changes are measurable.
+      r.material.fragmentShader=waveFragment.slice(0,waveFragment.lastIndexOf('void main() {'))+`
+        uniform int testLayer;
+        uniform float testShift;
+        vec2 packEdge(float edge) {
+          float v=floor(clamp(edge*.5+.5,0.0,1.0)*65535.0+.5);
+          return vec2(floor(v/256.0),mod(v,256.0))/255.0;
+        }
+        void main() {
+          float x=(vUv.x-.5)*1.65/uWidth+testShift;
+          vec3 e=ps3Layer(x,testLayer);
+          gl_FragColor=vec4(packEdge(e.x),packEdge(e.y));
+        }
+      `;
+      r.uniforms.testLayer={value:0};r.uniforms.testShift={value:0};
+      r.material.needsUpdate=true;
+      function edges(time,strength,height,shift,duration=12){
+        const sheets=[];r.uniforms.testShift.value=shift;
+        for(let i=0;i<4;i++){
+          r.uniforms.testLayer.value=i;
+          r.renderAt({...config,layer_motion:strength,height},time,{width:96,height:1},duration);
+          const p=r.readPixels(),a=[],b=[];
+          for(let x=0;x<96;x++){
+            a.push((p[x*4]*256+p[x*4+1])/65535*2-1);
+            b.push((p[x*4+2]*256+p[x*4+3])/65535*2-1);
+          }
+          sheets.push({a,b});
+        }
+        return sheets;
+      }
+      const sheets=[];
+      for(const strength of [0,1,2])for(const height of [0,.3,.55,2]){
+        const initial=edges(0,strength,height,0);
+        let relative=0,widthChange=0,span=0;
+        const perLayer=[0,0,0,0];
+        for(const time of [1.5,3,4.5,6,7.5,9,10.5]){
+          const sample=edges(time,strength,height,(time/12*2*Math.PI)/3.687);
+          for(let x=0;x<96;x++){
+            const values=sample.flatMap(s=>[s.a[x],s.b[x]]);
+            span=Math.max(span,Math.max(...values)-Math.min(...values));
+            for(let i=0;i<4;i++){
+              const width=Math.abs((sample[i].a[x]-sample[i].b[x])-(initial[i].a[x]-initial[i].b[x]));
+              widthChange=Math.max(widthChange,width);perLayer[i]=Math.max(perLayer[i],width);
+              for(let j=i+1;j<4;j++){
+                const gap=s=>(s[i].a[x]+s[i].b[x]-s[j].a[x]-s[j].b[x])*.5;
+                relative=Math.max(relative,Math.abs(gap(sample)-gap(initial)));
+              }
+            }
+          }
+        }
+        sheets.push({strength,height,relative,widthChange,span,perLayer});
+      }
+      const velocities=[];
+      for(const strength of [0,1,2])for(const duration of [1,10,12])for(const fps of [30,60]){
+        const step=1/(fps*8),first=edges(0,strength,.55,0,duration);
+        const after=edges(step,strength,.55,0,duration);
+        const before=edges(duration-step,strength,.55,0,duration);
+        let jerk=0;
+        for(let i=0;i<4;i++)for(const edge of ['a','b'])for(let x=0;x<96;x++)
+          jerk=Math.max(jerk,Math.abs(after[i][edge][x]+before[i][edge][x]-2*first[i][edge][x]));
+        velocities.push({strength,duration,fps,jerk});
+      }
+      r.dispose();return {loops,stopped,sheets,velocities};
+    }""")
+    assert all(item["endpoint"] for item in result["loops"]), result
+    # A one-second loop moves narrow highlights several pixels per frame;
+    # inspect subframe edge derivatives separately from image intensity changes.
+    assert all(item["jerk"] < 3 for item in result["loops"]), result["loops"]
+    assert all(item["jerk"] < .0008 for item in result["velocities"]), result["velocities"]
+    assert all(result["stopped"]), result
+    for item in result["sheets"]:
+        if item["strength"] == 0 or item["height"] == 0:
+            assert item["relative"] < .00015 and item["widthChange"] < .00015, item
+        else:
+            amplitude = item["height"] / .55
+            assert .004 < item["relative"] / amplitude < .2, item
+            assert all(value / amplitude > .0005 for value in item["perLayer"]), item
+            assert item["span"] / amplitude < .32, item
+    (RESULTS / f"layer-motion-{channel}.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    print(f"[{channel}] independent sheet motion, bounded band and 18 loop cases passed", flush=True)
+
+
 def check_browser(playwright, channel, url):
     print(f"[{channel}] starting", flush=True)
     browser = playwright.chromium.launch(channel=channel, headless=True)
@@ -66,6 +178,7 @@ def check_browser(playwright, channel, url):
     assert page.evaluate("() => {const ids=[...document.querySelectorAll('[id]')].map(el=>el.id);return new Set(ids).size===ids.length;}")
     page.locator("#play").click()
     page.screenshot(path=str(RESULTS / f"dashboard-{channel}.png"))
+    check_layer_motion(page, channel)
 
     # Full-resolution render math: closure, animation, zero speeds and rotation.
     checks = page.evaluate("""async () => {
@@ -73,9 +186,10 @@ def check_browser(playwright, channel, url):
       const {DEFAULT_SCENE,loopState}=await import('/static/js/scene.js');
       const r=new WaveRenderer();const results=[];
       for(const style of ['psp-classic','psp-original','ps3']) {
+       for(const layer_motion of style==='ps3'?[0,1,2]:[1]) {
         for(const rotation of [0,45,90]) {
           for(const size of [{width:256,height:144},{width:144,height:256},{width:192,height:192}]) {
-            const c={...DEFAULT_SCENE,style,rotation};
+            const c={...DEFAULT_SCENE,style,rotation,layer_motion};
             r.renderAt(c,0,size,7);const a=r.readPixels().slice();
             r.renderAt(c,7,size,7);const b=r.readPixels().slice();
             let endpoint=0;for(let i=0;i<a.length;i++)endpoint=Math.max(endpoint,Math.abs(a[i]-b[i]));
@@ -85,9 +199,10 @@ def check_browser(playwright, channel, url):
             r.renderAt(c,1/60,size,7);const after=r.readPixels().slice();
             r.renderAt(c,7-1/60,size,7);const before=r.readPixels().slice();
             let jerk=0;for(let i=0;i<a.length;i++)jerk+=Math.abs(after[i]+before[i]-2*a[i]);
-            results.push({style,rotation,...size,endpoint,movement:movement/a.length,jerk:jerk/a.length});
+            results.push({style,rotation,layer_motion,...size,endpoint,movement:movement/a.length,jerk:jerk/a.length});
           }
         }
+       }
       }
       const c={...DEFAULT_SCENE,speed:0,particle_speed:0};
       r.renderAt(c,0,{width:128,height:128},10);const a=r.readPixels().slice();
@@ -102,7 +217,7 @@ def check_browser(playwright, channel, url):
     assert checks["stopped"]
     assert checks["positive"]["waveSpeed"] > 0 and checks["positive"]["particleSpeed"] > 0
     (RESULTS / f"render-checks-{channel}.json").write_text(json.dumps(checks, indent=2), encoding="utf-8")
-    print(f"[{channel}] 27 render/rotation/aspect loop checks passed", flush=True)
+    print(f"[{channel}] 45 render/rotation/aspect loop checks passed", flush=True)
 
     # Reference video motion is predominantly rightward transport, not fixed
     # control points bobbing up and down. Compare translated GPU light profiles.
@@ -110,7 +225,7 @@ def check_browser(playwright, channel, url):
       const {WaveRenderer}=await import('/static/js/renderer.js');
       const data=await (await fetch('/api/presets')).json();
       const c={...data.styles.find(s=>s.id==='ps3').defaults,color:'#672286',
-        background_color:'#000000',particle_count:0};
+        background_color:'#000000',particle_count:0,layer_motion:0};
       const r=new WaveRenderer();
       function profile(time,speed=1){
         r.renderAt({...c,speed},time,{width:800,height:450},12);
@@ -262,6 +377,29 @@ def check_browser(playwright, channel, url):
     assert page.evaluate("window.studio.scene.particle_size") == 2.25
     assert page.locator("#particle_size").input_value() == "2.25"
 
+    page.locator("#advanced summary").click()
+    assert page.locator("#layer-motion-control").is_visible()
+    assert page.locator("#layer_motion").get_attribute("step") == "0.05"
+    set_range(page, "layer_motion", 1.65)
+    page.reload()
+    page.wait_for_function("!!window.studio")
+    assert page.evaluate("window.studio.scene.layer_motion") == 1.65
+    assert page.locator("#layer_motion").input_value() == "1.65"
+    # Revision 2 clients have no new field. Supply only the missing value,
+    # retaining every saved edit and the existing preset revision.
+    page.evaluate("""()=>{
+      const stored=JSON.parse(localStorage.getItem('xmb-wave-studio-v1'));
+      delete stored.scene.layer_motion;
+      stored.scene.color='#7958b6';stored.scene.width=1.5;stored.scene.rotation=90;
+      localStorage.setItem('xmb-wave-studio-v1',JSON.stringify(stored));
+    }""")
+    page.reload()
+    page.wait_for_function("!!window.studio")
+    restored = page.evaluate("window.studio.scene")
+    assert restored["layer_motion"] == 1 and restored["particle_size"] == 2.25, restored
+    assert restored["color"] == "#7958b6" and restored["width"] == 1.5 and restored["rotation"] == 90, restored
+    assert page.evaluate("JSON.parse(localStorage.getItem('xmb-wave-studio-v1')).revision") == 2
+
     # Old stored settings get the revised untouched defaults, while actual edits survive.
     page.evaluate("""()=>{
       localStorage.setItem('xmb-wave-studio-v1',JSON.stringify({scene:{
@@ -277,6 +415,7 @@ def check_browser(playwright, channel, url):
     assert migrated["particle_count"] == 0 and migrated["particle_size"] == 1, migrated
     assert migrated["rotation"] == 90 and migrated["width"] == 1.5, migrated
     assert migrated["color"] == "#7958b6", migrated
+    assert migrated["layer_motion"] == 1, migrated
     print(f"[{channel}] sharp/soft particle footprints, size and settings migration passed", flush=True)
 
     # Form behavior, persistence, model sizes and independent shape/output controls.
@@ -289,6 +428,7 @@ def check_browser(playwright, channel, url):
     assert page.evaluate("window.studio.scene.rotation") == 90
     assert not page.locator("#particles-section").is_visible()
     page.locator("#advanced summary").click()
+    assert not page.locator("#layer-motion-control").is_visible()
     set_range(page, "scene-width", 1.5)
     assert page.locator("#width").input_value() == "1179"
     assert page.evaluate("window.studio.scene.width") == 1.5
@@ -298,7 +438,10 @@ def check_browser(playwright, channel, url):
     assert page.evaluate("window.studio.scene.width") == 1.5
     page.locator('[data-style="ps3"]').click()
     page.locator("#advanced summary").click()
+    assert page.locator("#layer-motion-control").is_visible()
+    set_range(page, "layer_motion", 2)
     page.locator("#reset").click()
+    assert page.evaluate("window.studio.scene.layer_motion") == 1
     # Pause after a reload regardless of the initial prefers-reduced-motion setting.
     if page.locator("#play").get_attribute("aria-label") == "일시정지":
         page.locator("#play").click()
@@ -345,6 +488,7 @@ def check_browser(playwright, channel, url):
         page.locator("#save-video").click()
     job_id = info.value.json()["id"]
     page.wait_for_function("window.studio.busy")
+    assert page.locator("#layer_motion").is_disabled()
     page.locator("#cancel-export").click()
     page.wait_for_function("!window.studio.busy")
     assert context.request.get(f"{url}/api/exports/{job_id}").json()["status"] == "cancelled"

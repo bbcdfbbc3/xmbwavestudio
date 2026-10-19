@@ -102,6 +102,33 @@ def test_particle_size_optional_for_old_clients_and_bounded_for_new_clients(clie
         client.delete(f"/api/exports/{response.json()['id']}")
 
 
+@pytest.mark.parametrize("strength", [-0.05, 2.05])
+def test_rejects_invalid_layer_motion(client, strength):
+    payload = request()
+    payload["scene"]["layer_motion"] = strength
+    assert client.post("/api/exports", json=payload).status_code == 422
+
+
+@pytest.mark.parametrize("strength", [float("inf"), -float("inf"), float("nan")])
+def test_layer_motion_must_be_finite(strength):
+    with pytest.raises(ValueError):
+        SceneConfig(layer_motion=strength)
+
+
+def test_layer_motion_optional_and_bounded(client):
+    payload = request()
+    payload["scene"].pop("layer_motion")
+    assert SceneConfig.model_validate(payload["scene"]).layer_motion == 1
+    assert all(style["defaults"]["layer_motion"] == 1
+               for style in client.get("/api/presets").json()["styles"])
+    for strength in [None, 0, 1, 2]:
+        if strength is not None:
+            payload["scene"]["layer_motion"] = strength
+        response = client.post("/api/exports", json=payload)
+        assert response.status_code == 201, response.text
+        client.delete(f"/api/exports/{response.json()['id']}")
+
+
 @pytest.mark.parametrize("width,height,fps", [(32, 32, 30), (33, 35, 60), (1, 1, 30)])
 def test_real_h264_encoding(client, tmp_path, width, height, fps):
     job_id = create(client, width=width, height=height, fps=fps)

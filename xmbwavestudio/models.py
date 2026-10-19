@@ -20,6 +20,7 @@ class SceneConfig(BaseModel):
     height: float = Field(default=0.55, ge=0, le=2)
     width: float = Field(default=1.15, ge=0.25, le=3)
     overlap: float = Field(default=0.82, ge=0, le=1)
+    layer_motion: float = Field(default=1, ge=0, le=2)
     x: float = Field(default=0, ge=-1, le=1)
     y: float = Field(default=0, ge=-1, le=1)
     scale: float = Field(default=1, ge=0.25, le=3)

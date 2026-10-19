@@ -81,6 +81,11 @@
           <details class="control-section advanced" id="advanced">
             <summary><span>고급 조절</span><span class="summary-plus">+</span></summary>
             <div id="advanced-ranges"></div>
+            <div id="layer-motion-control">
+              <div class="control-label"><label for="layer_motion">레이어 움직임 차이</label><output id="layer_motion-value">1.00×</output></div>
+              <input id="layer_motion" data-scene="layer_motion" type="range" min="0" max="2" step="0.05" value="1" aria-describedby="layer-motion-help">
+              <p class="subtle" id="layer-motion-help">0 · 함께 이동 / 1 · 영상 기준 / 2 · 엇갈림 강조</p>
+            </div>
             <div class="advanced-color"><label><input type="checkbox" id="background-override"> 배경색 따로 지정</label><input type="color" id="background-color" value="#4387de" aria-label="배경색"></div>
             <div class="advanced-color"><label><input type="checkbox" id="wave-override"> 물결색 따로 지정</label><input type="color" id="wave-color" value="#bdd6f6" aria-label="물결색"></div>
             <button class="text-button reset-button" id="reset" type="button"><svg viewBox="0 0 24 24"><path d="M3 10a9 9 0 1 1 2 8M3 4v6h6"/></svg> 이 스타일 기본값으로</button>

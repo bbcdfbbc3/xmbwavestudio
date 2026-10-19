@@ -105,6 +105,7 @@ function refreshScene() {
   });
   document.querySelectorAll('[data-angle]').forEach((button) => button.classList.toggle('active', +button.dataset.angle === scene.rotation));
   $('particles-section').hidden = scene.style !== 'ps3';
+  $('layer-motion-control').hidden = scene.style !== 'ps3';
   $('preview-style').textContent = presets.styles.find((style) => style.id === scene.style).name;
   for (const key of ['background', 'wave']) {
     $(`${key}-override`).checked = scene[`${key}_color`] !== null;

@@ -1,7 +1,7 @@
 /** Pure, resolution-independent settings and closed animation phases. */
 export const DEFAULT_SCENE = Object.freeze({
   style: 'ps3', color: '#3264c5', background_color: null, wave_color: null,
-  speed: 0.5, rotation: 0, height: 0.55, width: 1.15, overlap: 0.82, x: 0, y: 0,
+  speed: 0.5, rotation: 0, height: 0.55, width: 1.15, overlap: 0.82, layer_motion: 1, x: 0, y: 0,
   scale: 1, glow: 0.9, particle_count: 450, particle_speed: 0.4, particle_size: 1, seed: 2026,
 });
 export const PRESET_REVISION = 2;

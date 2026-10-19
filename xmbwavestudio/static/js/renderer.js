@@ -33,6 +33,7 @@ export class WaveRenderer {
       uPhase: {value: 0}, uStyle: {value: 2},
       uRotation: {value: 0}, uHeight: {value: 0.65}, uWidth: {value: 1},
       uOverlap: {value: 0.6}, uScale: {value: 1}, uGlow: {value: 1},
+      uLayerMotion: {value: 1},
       uOffset: {value: new THREE.Vector2()},
     };
     this.material = new THREE.ShaderMaterial({
@@ -128,6 +129,7 @@ export class WaveRenderer {
     u.uHeight.value = config.height;
     u.uWidth.value = config.width;
     u.uOverlap.value = config.overlap;
+    u.uLayerMotion.value = config.layer_motion ?? 1;
     u.uScale.value = config.scale;
     u.uGlow.value = config.glow;
     u.uOffset.value.set(config.x, config.y);
