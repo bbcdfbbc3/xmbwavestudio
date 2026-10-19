@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>XMB Wave Studio — 나만의 흐름</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%23151320'/%3E%3Cpath d='M4 19Q10 9 16 16T28 13M4 23Q10 13 16 20T28 17' fill='none' stroke='%23b6a0ff' stroke-width='2'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/style.css">
+  <script type="module" src="/static/js/app.js"></script>
+</head>
+<body>
+  <div class="studio">
+    <header class="header">
+      <a class="brand" href="/" aria-label="XMB Wave Studio 홈">
+        <span class="brand-mark"><svg viewBox="0 0 36 36" aria-hidden="true"><path d="M4 20C10 5 19 30 32 12M4 26C12 11 21 35 32 18M4 14C12 0 20 24 32 6"/></svg></span>
+        <span><strong>XMB<span class="brand-thin"> Wave Studio</span></strong><small>MAKE YOUR OWN FLOW</small></span>
+      </a>
+      <div class="header-meta"><span class="local-badge"><i></i> 로컬 렌더링</span><span class="header-divider"></span><span class="version" id="version">v0.1.0</span><a class="icon-button" href="https://github.com/bbcdfbbc3/xmbwavestudio" target="_blank" rel="noopener noreferrer" aria-label="GitHub 프로젝트"><svg viewBox="0 0 24 24"><path d="M8 8 4 12l4 4m8-8 4 4-4 4m-3-11-2 14"/></svg></a></div>
+    </header>
+
+    <main class="workspace">
+      <section class="preview-panel" aria-label="실시간 미리보기">
+        <div class="stage-toolbar"><div class="eyebrow"><span class="tiny-dot"></span> LIVE CANVAS <span class="toolbar-slash">/</span><span id="preview-style">PS3 Wave</span></div><div class="preview-quality"><label for="quality">미리보기</label><select id="quality"><option value="720">고화질</option><option value="480">균형</option><option value="320">저사양</option></select></div></div>
+        <div class="stage" id="stage">
+          <div class="canvas-surround" id="canvas-surround">
+            <div class="canvas-topline"><span id="canvas-preset">CUSTOM CANVAS</span><span id="ratio-label">9:16</span></div>
+            <div class="canvas-frame" id="canvas-frame"><canvas id="preview" aria-label="웨이브 배경 미리보기"></canvas></div>
+            <div class="canvas-bottomline"><span id="canvas-dimensions">1080 × 1920</span><span>SDR · sRGB</span></div>
+          </div>
+          <div class="stage-watermark" aria-hidden="true">A LITTLE NOSTALGIA.<br>A FLOW OF YOUR OWN.</div>
+          <div class="loading" id="loading">웨이브를 준비하는 중…</div>
+        </div>
+        <div class="transport">
+          <button class="icon-button" id="restart" aria-label="처음으로 이동" title="처음으로"><svg viewBox="0 0 24 24"><path d="M5 5v14m14-14L8 12l11 7Z"/></svg></button>
+          <button class="play-button" id="play" aria-label="일시정지" title="재생 / 일시정지"><svg viewBox="0 0 24 24" id="play-icon"><path d="M8 5v14M16 5v14"/></svg></button>
+          <span class="time-display" id="time-display">00:00.0</span>
+          <input id="timeline" type="range" min="0" max="10" step="0.001" value="0" aria-label="장면 시간">
+          <span class="duration-display" id="duration-display">00:10</span>
+          <span class="loop-badge"><svg viewBox="0 0 24 24"><path d="M18 5l3 3-3 3M6 19l-3-3 3-3M21 8H8a5 5 0 0 0-5 5m0 3h13a5 5 0 0 0 5-5"/></svg> SEAMLESS</span>
+        </div>
+      </section>
+
+      <aside class="inspector" aria-label="웨이브 설정">
+        <fieldset id="scene-controls">
+          <section class="control-section style-section">
+            <div class="section-heading"><h1>나만의 흐름 만들기</h1><span class="section-number">01</span></div>
+            <p class="section-description">익숙한 물결에 새로운 색을 입혀봐.</p>
+            <div class="style-options" id="style-options" role="group" aria-label="웨이브 스타일"></div>
+          </section>
+
+          <section class="control-section">
+            <div class="section-heading"><h2>색상</h2><span class="section-number">02</span></div>
+            <div class="palette" id="palette" role="group" aria-label="색상 팔레트"></div>
+            <div class="color-picker-row"><label class="color-chip" title="직접 색상 선택"><input id="color" type="color" value="#4387de" aria-label="기본 색상 선택"></label><input id="color-hex" type="text" value="#4387DE" maxlength="7" aria-label="기본 색상 HEX 코드" spellcheck="false"><span>사용자 지정 색상</span></div>
+          </section>
+
+          <section class="control-section">
+            <div class="section-heading"><h2>움직임</h2><span class="section-number">03</span></div>
+            <div class="control-label"><label for="speed">웨이브 속도</label><output id="speed-value">1.00×</output></div>
+            <input id="speed" data-scene="speed" type="range" min="0" max="4" step="0.05" value="1">
+            <div class="range-labels"><span>고요하게</span><span>빠르게</span></div>
+            <div class="loop-info" id="loop-info">반복 주기에 맞춰 실제 속도를 조정해요.</div>
+            <div class="control-label rotation-label"><label for="rotation">웨이브 회전</label><output id="rotation-value">0°</output></div>
+            <input id="rotation" data-scene="rotation" type="range" min="0" max="360" step="1" value="0">
+            <div class="rotation-presets" id="rotation-presets"><button type="button" data-angle="0" class="active">0°</button><button type="button" data-angle="90">90°</button><button type="button" data-angle="180">180°</button><button type="button" data-angle="270">270°</button></div>
+          </section>
+
+          <section class="control-section" id="particles-section">
+            <div class="section-heading"><h2>파티클</h2><span class="pill">PS3</span></div>
+            <div class="control-label"><label for="particle_count">반짝이는 입자</label><output id="particle_count-value">450</output></div>
+            <input id="particle_count" data-scene="particle_count" type="range" min="0" max="2000" step="1" value="450">
+            <div class="control-label"><label for="particle_size">입자 크기</label><output id="particle_size-value">1.00×</output></div>
+            <input id="particle_size" data-scene="particle_size" type="range" min="0.25" max="4" step="0.05" value="1">
+            <p class="subtle">작고 또렷한 빛점과 부드럽게 퍼지는 입자가 함께 흘러가.</p>
+            <div class="control-label"><label for="particle_speed">이동 속도</label><output id="particle_speed-value">1.00×</output></div>
+            <input id="particle_speed" data-scene="particle_speed" type="range" min="0" max="4" step="0.05" value="1">
+            <p class="subtle" id="particle-loop-info"></p>
+          </section>
+
+          <details class="control-section advanced" id="advanced">
+            <summary><span>고급 조절</span><span class="summary-plus">+</span></summary>
+            <div id="advanced-ranges"></div>
+            <div class="advanced-color"><label><input type="checkbox" id="background-override"> 배경색 따로 지정</label><input type="color" id="background-color" value="#4387de" aria-label="배경색"></div>
+            <div class="advanced-color"><label><input type="checkbox" id="wave-override"> 물결색 따로 지정</label><input type="color" id="wave-color" value="#bdd6f6" aria-label="물결색"></div>
+            <button class="text-button reset-button" id="reset" type="button"><svg viewBox="0 0 24 24"><path d="M3 10a9 9 0 1 1 2 8M3 4v6h6"/></svg> 이 스타일 기본값으로</button>
+          </details>
+        </fieldset>
+      </aside>
+    </main>
+
+    <section class="export-panel" aria-label="배경화면 제작">
+      <div class="export-settings">
+        <div class="export-field resolution-field"><label for="device">캔버스 해상도</label><select id="device"><option value="custom">사용자 지정</option><option value="portrait">세로 · 1080 × 1920</option><option value="landscape">가로 · 1920 × 1080</option><option value="4k">4K · 3840 × 2160</option><option value="square">정사각형 · 1080 × 1080</option></select></div>
+        <div class="export-field size-field"><label for="width">가로 × 세로 <a id="device-source" target="_blank" rel="noopener noreferrer" hidden>공식 사양 ↗</a></label><div class="size-inputs"><input id="width" type="number" min="1" step="1" value="1080" aria-label="가로 픽셀"><span>×</span><input id="height" type="number" min="1" step="1" value="1920" aria-label="세로 픽셀"><button class="icon-button" id="swap" title="가로·세로 전환" aria-label="가로·세로 전환"><svg viewBox="0 0 24 24"><path d="M4 7h15m-4-4 4 4-4 4M20 17H5m4-4-4 4 4 4"/></svg></button></div></div>
+        <div class="export-field duration-field"><label for="duration">영상 길이</label><div class="input-unit"><input id="duration" type="number" min="1" step="1" value="10"><span>초</span></div></div>
+        <div class="export-field fps-field"><label for="fps">프레임</label><select id="fps"><option value="30">30 fps</option><option value="60">60 fps</option></select></div>
+        <div class="export-actions"><button class="secondary-button" id="save-image"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="m3 16 5-5 5 5 3-3 5 5M15 8h.01"/></svg> JPEG 저장</button><button class="primary-button" id="save-video"><svg viewBox="0 0 24 24"><path d="M12 3v12m-5-5 5 5 5-5M4 16v5h16v-5"/></svg> 영상 만들기</button></div>
+      </div>
+      <div class="export-info"><span id="output-summary">MP4 · H.264 · 1080 × 1920 · 300 프레임</span><span id="export-hint">이 PC에서 제작 · 저장하는 동안 탭을 열어둬</span></div>
+      <div class="job-progress" id="job-progress" hidden>
+        <div class="progress-copy"><span id="job-label">프레임을 만드는 중</span><strong id="job-percent">0%</strong></div>
+        <div class="progress-track"><div id="progress-fill"></div></div>
+        <div class="progress-details"><span id="job-details"></span><button class="text-button" id="cancel-export">제작 취소</button><a class="download-button" id="download-video" hidden download>MP4 다운로드 ↓</a></div>
+      </div>
+    </section>
+    <footer class="footer"><span><i></i> 모든 렌더링은 이 PC 안에서.</span><span id="gpu-status">GPU 확인 중</span></footer>
+  </div>
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+  <div class="fatal-error" id="fatal-error" role="alert" hidden><div><span class="eyebrow">RENDERER UNAVAILABLE</span><h2>물결을 그릴 수 없어요</h2><p id="fatal-message"></p><button class="primary-button" onclick="location.reload()">다시 열기</button></div></div>
+</body>
+</html>
