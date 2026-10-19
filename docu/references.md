@@ -94,9 +94,11 @@ Classic은 사용자가 첨부한 파란 화면의 상단 곡면과 하단 앞�
 
 ## 라이브러리와 파일 형식
 
-- [Three.js WebGLRenderer](https://threejs.org/docs/pages/WebGLRenderer.html): WebGL2, sRGB 출력, 그래픽 초기화·크기 검사.
-- [Three.js ShaderMaterial](https://threejs.org/docs/pages/ShaderMaterial.html): 자체 셰이더 작성. 프로젝트에는 Three.js 0.180.0과 MIT 라이선스 원문을 포함한다.
-- [FastAPI WebSockets](https://fastapi.tiangolo.com/advanced/websockets/): 로컬 프레임 전송·연결 종료 처리.
+- [ModernGL Context](https://moderngl.readthedocs.io/en/latest/reference/context.html): 독립 OpenGL 컨텍스트, GPU 버퍼·프레임버퍼·인스턴스 그리기. 기존 Three.js 셰이더를 GLSL 330으로 옮겼으며 현재 제품에는 Three.js를 포함하지 않는다.
+- [NVIDIA FFmpeg GPU 가속](https://docs.nvidia.com/video-technologies/video-codec-sdk/13.0/ffmpeg-with-nvidia-gpu/index.html): NVENC 하드웨어 인코더 사용. 이 앱은 GPU 읽기 후 raw RGBA를 FFmpeg에 넘기므로 GPU zero-copy 구성은 아니다.
+- [FFmpeg 코덱](https://ffmpeg.org/ffmpeg-codecs.html): QSV·AMF·libx264 인코더 옵션. 실제 장치·출력 크기로 시험한 뒤 가능한 인코더를 선택한다. Intel·AMD 실기 검증은 별도로 필요하다.
+- [FFmpeg H.264 메타데이터](https://ffmpeg.org/ffmpeg-bitstream-filters.html#h264_005fmetadata): 비트스트림에 BT.709 원색·행렬, sRGB 전달 특성, 제한 범위 정보를 기록한다.
+- [FastAPI WebSockets](https://fastapi.tiangolo.com/advanced/websockets/): 작은 미리보기 이미지·진행 상태·연결 종료 처리. 완성 영상 프레임을 브라우저가 업로드하지 않는다.
 - [imageio-ffmpeg](https://github.com/imageio/imageio-ffmpeg): FFmpeg 실행 파일 제공. 별도 인코더의 사용 조건은 해당 배포본을 따른다.
 - [FFmpeg](https://ffmpeg.org/ffmpeg.html): raw RGBA 입력, H.264 인코딩.
 - [Apple Live Photo 배경화면 안내](https://support.apple.com/en-ae/120734): MP4 파일 제작과 iPhone 잠금화면 적용은 별도 기능이다. v1은 Live Photo 변환을 제공하지 않는다.

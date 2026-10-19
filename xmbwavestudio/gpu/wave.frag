@@ -1,12 +1,11 @@
-// Original analytic shaders. No console firmware, textures or third-party wave code.
-export const screenVertex = `
-varying vec2 vUv;
-void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }
-`;
+#version 330
 
-export const waveFragment = `
 precision highp float;
-varying vec2 vUv;
+in vec2 vUv;
+out vec4 fragColor;
+uniform vec2 uRasterSize;
+vec3 toSrgb(vec3 v) { return mix(1.055*pow(max(v,vec3(0.0)),vec3(1.0/2.4))-.055,12.92*v,lessThanEqual(v,vec3(.0031308))); }
+
 uniform vec2 uResolution;
 uniform vec3 uBase, uBackground, uWave, uAccent;
 uniform float uPhase, uRotation, uHeight, uWidth, uOverlap, uScale, uGlow;
@@ -215,67 +214,10 @@ void main() {
   else if(uStyle==1) color=original(p,color);
   else color+=ps3(p);
   // Small, static screen-space dither avoids visible gradient banding in JPEG and H.264.
-  vec2 pixel=floor(vUv*uResolution);
+  vec2 pixel=floor(vUv*uRasterSize);
   float dither=fract(sin(dot(pixel,vec2(12.9898,78.233)))*43758.5453)-.5;
-  gl_FragColor=vec4(max(vec3(0.0),color),1.0);
-  #include <tonemapping_fragment>
-  #include <colorspace_fragment>
-  gl_FragColor.rgb += dither/1024.0;
-}
-`;
+  fragColor=vec4(max(vec3(0.0),color),1.0);
 
-export const particleVertex = `
-attribute vec4 aRandom;
-attribute vec2 aDepth;
-uniform vec2 uResolution;
-uniform float uPhase, uRotation, uScale, uPixelScale, uSize;
-uniform vec2 uOffset;
-varying float vAlpha, vDefocus, vWarmth;
-varying vec2 vSpriteUv;
-void main() {
-  float progress=fract(aRandom.x+uPhase/6.283185307);
-  float turn=progress*6.283185307;
-  float c=cos(uRotation),s=sin(uRotation);
-  float shorter=min(uResolution.x,uResolution.y);
-  float span=abs(c)*uResolution.x/shorter+abs(s)*uResolution.y/shorter;
-  float x=(progress-.5)*2.1;
-  float scatter=mix(.19,1.8,step(.72,aDepth.y));
-  vec2 p=vec2(x*span/1.65,-.025+.04*sin(x*1.9)+(aRandom.z-.5)*scatter);
-  p.y+=.018*sin(turn*2.0+aRandom.y*6.28);
-  p=mat2(c,s,-s,c)*p*uScale+uOffset;
-  vDefocus=smoothstep(.52,1.0,aDepth.x);
-  float diameter=(1.4+pow(aRandom.w,3.0)*2.8)*(1.0+vDefocus*3.0)*uPixelScale*uSize;
-  gl_Position=vec4(p*2.0*shorter/uResolution+position.xy*diameter*2.0/uResolution,0.0,1.0);
-  float lifetime=smoothstep(0.0,.08,progress)*(1.0-smoothstep(.92,1.0,progress));
-  float twinkle=.5+.5*sin(turn*3.0+aRandom.y*6.28);
-  vAlpha=lifetime*(.23+.77*pow(twinkle,10.0))*(.55+aRandom.y*.45);
-  vWarmth=aDepth.y;
-  vSpriteUv=uv;
+  fragColor.rgb=toSrgb(fragColor.rgb);
+  fragColor.rgb += dither/1024.0;
 }
-`;
-
-export const particleFragment = `
-precision highp float;
-uniform vec3 uWave;
-varying float vAlpha, vDefocus, vWarmth;
-varying vec2 vSpriteUv;
-void main() {
-  vec2 p=(vSpriteUv-.5)*2.0;
-  float radius=length(p);
-  if(radius>1.0) discard;
-  // Integrate tiny focused cores over their pixel footprint instead of letting them alias away.
-  float pixelSize=max(fwidth(p.x),fwidth(p.y));
-  float focusWidth=max(.18,.7*pixelSize);
-  float rayWidth=max(.035,.3*pixelSize);
-  float core=exp(-dot(p,p)/(focusWidth*focusWidth));
-  float rays=exp(-abs(p.x)/rayWidth)*exp(-abs(p.y)*6.0)
-            +exp(-abs(p.y)/rayWidth)*exp(-abs(p.x)*6.0);
-  float sharp=core*.9+rays*.18+exp(-dot(p,p)*7.0)*.045;
-  float soft=exp(-dot(p,p)*3.6)*.22;
-  float edge=1.0-smoothstep(.72,1.0,radius);
-  float alpha=mix(sharp,soft,vDefocus)*vAlpha*edge;
-  vec3 color=mix(mix(uWave,vec3(1.0),.8),vec3(1.0,.91,.79),vWarmth*.18);
-  gl_FragColor=vec4(color,alpha);
-  #include <colorspace_fragment>
-}
-`;

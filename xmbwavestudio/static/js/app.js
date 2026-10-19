@@ -1,6 +1,6 @@
-import {WaveRenderer} from './renderer.js';
+import {RemotePreview} from './preview-client.js';
 import {DEFAULT_SCENE, DEFAULT_OUTPUT, PRESET_REVISION, migrateScene, loopState, encodedSize, frameCount, aspectLabel} from './scene.js';
-import {VideoExport, api, makeJpeg, download} from './export-client.js';
+import {VideoExport, api, response, makeJpeg, download} from './export-client.js';
 
 const $ = (id) => document.getElementById(id);
 const STORAGE_KEY = 'xmb-wave-studio-v1';
@@ -25,6 +25,7 @@ let previewSize = {width: 360, height: 640};
 let toastTimer;
 let quality = 720;
 let animationId;
+let lastPreview = 0;
 
 function notify(message, error = false) {
   $('toast').textContent = message;
@@ -35,7 +36,8 @@ function notify(message, error = false) {
 }
 
 function fatal(error) {
-  $('fatal-message').textContent = `${error.message} Edge 또는 Chrome의 하드웨어 가속이 켜져 있는지 확인해 주세요.`;
+  console.error(error);
+  $('fatal-message').textContent = `${error.message} Python 서버와 PC의 그래픽 드라이버를 확인해 주세요.`;
   $('fatal-error').hidden = false;
   $('loading').hidden = true;
   cancelAnimationFrame(animationId);
@@ -134,7 +136,7 @@ function resizePreview() {
   $('canvas-surround').style.height = `${height}px`;
   // Preserve the output aspect in shader coordinates regardless of preview quality.
   const pixelFactor = Math.min(quality / Math.min(output.width, output.height),
-    Math.min(renderer.maxSize / output.width, renderer.maxSize / output.height),
+    Math.min(2048 / output.width, 2048 / output.height),
     devicePixelRatio * factor);
   previewSize = {width: Math.max(1, Math.round(output.width * pixelFactor)), height: Math.max(1, Math.round(output.height * pixelFactor))};
   dirty = true;
@@ -185,16 +187,17 @@ function updatePlayButton() {
 
 function animate(now) {
   animationId = requestAnimationFrame(animate);
-  if (busy) return;
-  if (playing) currentTime = (clockOffset + (now - clockStart) / 1000) % output.duration;
+  if (busy || renderer.pending || now - lastPreview < 1000 / 30) return;
+  // RAF's timestamp can precede a clock reset performed later in the same frame.
+  if (playing) currentTime = (clockOffset + Math.max(0, now - clockStart) / 1000) % output.duration;
   if (!playing && !dirty) return;
-  try {
-    renderer.renderAt(scene, currentTime, previewSize, output.duration);
-    dirty = false;
+  lastPreview = now;
+  dirty = false;
+  renderer.renderAt({...scene}, currentTime, previewSize, output.duration, {...output}).then(() => {
     $('time-display').textContent = timeLabel(currentTime, true);
     $('timeline').value = currentTime;
     rangeFill($('timeline'));
-  } catch (error) { fatal(error); }
+  }).catch(fatal);
 }
 
 function progress(snapshot) {
@@ -205,7 +208,7 @@ function progress(snapshot) {
   $('job-label').textContent = done ? '나만의 웨이브, 완성!' : encoding ? 'MP4 파일을 마무리하는 중' : '프레임을 그리는 중';
   $('job-percent').textContent = `${percent}%`;
   $('progress-fill').style.width = `${percent}%`;
-  $('job-details').textContent = `${snapshot.frames.toLocaleString()} / ${snapshot.total_frames.toLocaleString()} 프레임 · 경과 ${timeLabel(snapshot.elapsed)}${snapshot.eta && !done && !encoding ? ` · 남은 시간 약 ${timeLabel(snapshot.eta)}` : ''}`;
+  $('job-details').textContent = `${snapshot.encoder} · ${snapshot.frames.toLocaleString()} / ${snapshot.total_frames.toLocaleString()} 프레임 · 경과 ${timeLabel(snapshot.elapsed)}${snapshot.eta && !done && !encoding ? ` · 남은 시간 약 ${timeLabel(snapshot.eta)}` : ''}`;
   $('cancel-export').hidden = done;
   if (done) {
     $('download-video').href = snapshot.download_url;
@@ -215,9 +218,12 @@ function progress(snapshot) {
 
 async function saveImage() {
   const time = currentTime;
+  const frozen = {...scene};
   setBusy(true);
   try {
-    const blob = await makeJpeg({...scene}, {...output}, time);
+    await renderer.pending;
+    await renderer.renderAt(frozen, time, previewSize, output.duration, {...output});
+    const blob = await makeJpeg(frozen, {...output}, time);
     const url = URL.createObjectURL(blob);
     download(url, `xmb-${scene.style}-${output.width}x${output.height}.jpg`);
     setTimeout(() => URL.revokeObjectURL(url), 60000);
@@ -237,6 +243,7 @@ async function saveVideo() {
   $('job-details').textContent = '제작하는 동안 이 탭을 열어둬.';
   activeExport = new VideoExport(progress);
   try {
+    await renderer.pending;
     const result = await activeExport.run({...scene}, {...output});
     download(result.download_url);
     notify('영상이 완성됐어. 다운로드 버튼으로 다시 저장할 수도 있어.');
@@ -343,15 +350,19 @@ async function init() {
     $('device').append(group);
   }
   restore();
-  const thumbs = new WaveRenderer();
-  try {
-    for (const style of presets.styles) {
-      thumbs.renderAt(style.defaults, 2, {width: 240, height: 140}, 10);
-      $(`thumb-${style.id}`).src = thumbs.canvas.toDataURL('image/jpeg', .9);
-    }
-  } finally { thumbs.dispose(); }
-  renderer = new WaveRenderer($('preview'));
-  $('gpu-status').textContent = `WEBGL 2 · MAX ${renderer.maxSize.toLocaleString()} PX`;
+  if (!presets.gpu.available) throw new Error(presets.gpu.error);
+  for (const style of presets.styles) {
+    const image = await response('/api/preview', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({scene: style.defaults, output: {...output, width: 240, height: 140},
+        time: 2, width: 240, height: 140})});
+    const url = URL.createObjectURL(await image.blob());
+    const thumbnail = $(`thumb-${style.id}`);
+    thumbnail.onload = () => URL.revokeObjectURL(url);
+    thumbnail.src = url;
+  }
+  renderer = new RemotePreview($('preview'), presets.gpu.max_size);
+  $('gpu-status').textContent = `PYTHON GPU · ${presets.encoder.name || '인코더 없음'}`;
+  $('gpu-status').title = presets.gpu.device;
   bind();
   refreshScene(); refreshOutput(); updatePlayButton();
   if (!presets.encoder.available) { $('save-video').disabled = true; notify(presets.encoder.error, true); }

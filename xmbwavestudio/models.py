@@ -39,6 +39,7 @@ class OutputConfig(BaseModel):
     height: int = Field(default=1920, ge=1, strict=True)
     duration: int = Field(default=10, ge=1, strict=True)
     fps: Literal[30, 60] = 30
+    encoder: Literal["auto", "software"] = "auto"
 
     @model_validator(mode="after")
     def safe_frame_count(self):
@@ -60,6 +61,16 @@ class ExportRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     scene: SceneConfig
     output: OutputConfig
+
+
+class ImageRequest(ExportRequest):
+    time: float = Field(default=0, ge=0, le=2**53 - 1, allow_inf_nan=False)
+
+
+class PreviewRequest(ImageRequest):
+    width: int = Field(default=360, ge=1, le=2048, strict=True)
+    height: int = Field(default=640, ge=1, le=2048, strict=True)
+    format: Literal["jpeg", "png"] = "jpeg"
 
 
 STYLE_PRESETS = [

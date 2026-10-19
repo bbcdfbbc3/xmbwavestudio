@@ -3,21 +3,23 @@
 ## 실행과 데이터 흐름
 
 ```text
-Python 실행 → 127.0.0.1 서버 준비 → 기본 브라우저 열기
-                                  ↓
-                        Three.js / WebGL2 편집기
-                         ├─ 작은 실시간 미리보기
-                         ├─ 실제 크기 렌더링 → JPEG 다운로드
-                         └─ 실제 크기 렌더링 → WebSocket → FFmpeg → MP4 다운로드
+Python 실행 → 네이티브 OpenGL 3.3 GPU 초기화 → 로컬 서버 → 브라우저 편집기
+                       ↑                                │ 설정·시각만 전송
+                       └────────────────────────────────┘
+                       ├─ 작은 JPEG 미리보기 → 브라우저 2D canvas
+                       ├─ 실제 크기 렌더링 → JPEG 다운로드
+                       └─ 실제 크기 RGBA → FFmpeg 파이프 → MP4 다운로드
 ```
 
-미리보기와 JPEG·MP4가 같은 `WaveRenderer.renderAt(config, time, size, duration)`를 사용한다. 시간 누적 시뮬레이션이나 해상도별 난수는 사용하지 않는다. 미리보기는 별도 화질 크기를 쓰지만 그래픽 좌표와 입자 시작값은 같다.
+미리보기와 JPEG·MP4가 `rendering.py`의 같은 `GpuRenderer.render(scene, time, width, height, duration, logical_size)`와 `gpu/`의 GLSL 셰이더를 사용한다. ModernGL 독립 컨텍스트로 네이티브 GPU에서 그리며, 소프트웨어 그래픽 장치는 오류로 표시한다. 브라우저에는 Three.js·WebGL 렌더러가 없다.
+
+OpenGL 객체는 단일 전용 스레드가 소유한다. 미리보기는 최대 30fps, 한 요청의 응답을 받은 뒤 다음 요청을 보낸다. 실제 출력 크기를 논리 좌표로 사용하고 작은 미리보기 크기만 별도로 지정하므로 반올림된 미리보기 화면비와 입자 크기가 출력 구도에 영향을 주지 않는다. sRGB 변환·Mulberry32 난수·입자 합성·모든 물결 함수를 기존 렌더러와 맞췄다. 해상도별 픽셀 샘플링과 JPEG/H.264 압축 차이는 남는다.
 
 ## 설정
 
 - `SceneConfig`: 스타일·색·속도·회전·모양·입자·난수 시작값. 입자 크기 `particle_size`는 0.25~4, 기본 1이며 생략한 예전 API 요청에도 기본값을 적용한다. Python 모델에서 API 입력을 검증한다.
 - `layer_motion`은 PS3 레이어의 상대 움직임 강도다. 유한한 0~2, 기본 1이며 이전 요청에서 생략해도 1을 적용한다. 다른 스타일은 이 값을 렌더링에 사용하지 않는다.
-- `OutputConfig`: 출력 종류·크기·길이·fps. 길이에 임의의 최대 초 수를 두지 않고 프레임 수의 JavaScript 정수 계산 가능 범위를 확인한다.
+- `OutputConfig`: 출력 종류·크기·길이·fps·`encoder`. `encoder=auto`가 기본이며 GPU 인코더가 불가능하면 CPU로 전환한다. `software`는 API에서 CPU 인코딩을 명시적으로 선택할 때 쓴다. 길이에 임의의 최대 초 수를 두지 않고 정확한 정수 계산 가능 범위를 확인한다.
 - 스타일별 기본값과 28개 기기 해상도는 로컬 API로 제공한다.
 - 브라우저 보관 키는 `xmb-wave-studio-v1`. 편집 설정만 저장하고 이미지나 영상은 보관하지 않는다.
 
@@ -51,23 +53,29 @@ PS3 입자는 별도 인스턴스 사각형 드로우 호출로 합성한다. �
 
 출력 프레임 `i`의 시각은 항상 `i/fps`. 느린 PC나 느려진 탭에서도 파일에 필요한 프레임을 모두 생성한다. 마지막 중복 프레임이나 끝부분 크로스페이드는 사용하지 않는다.
 
-## 영상 전송과 상태
+## API와 영상 제작
 
-1. 출력 해상도로 실제 GPU 렌더링·픽셀 읽기를 시도한다.
-2. `POST /api/exports`에 `{scene, output}`을 보내 작업을 만든다. 서버당 진행 중인 작업은 하나다.
-3. `/api/exports/{id}/frames` WebSocket에 연결한다. 서버의 `ready` 응답에 전송 청크 크기가 포함된다.
-4. 각 프레임은 `{"type":"frame","index":i}` 텍스트 헤더 이후 RGBA 바이트를 1MiB 이하의 바이너리 청크로 보낸다.
-5. 서버는 순서와 정확한 바이트 수를 확인하며 FFmpeg 표준 입력에 즉시 기록한다. 한 프레임의 `ack`를 받아야 다음 프레임을 시작한다.
-6. 마지막 프레임 이후 `encoding`, MP4 마무리 이후 `completed`를 보낸다. 진행 응답에 프레임 수·진행률·시간이 포함된다.
-7. 완료 파일은 `GET /api/exports/{id}/download`로 스트리밍 다운로드한다.
+| 인터페이스 | 역할 |
+|---|---|
+| `GET /api/presets` | 스타일·기기·GPU 장치·기본 인코더 정보 |
+| `WS /api/preview` | `{scene, output, time, width, height}` 요청 후 JPEG 응답, 한 장씩 처리 |
+| `POST /api/preview` | 같은 미리보기, `format=png`로 무손실 검사 가능 |
+| `POST /api/images` | `{scene, output, time}`의 실제 해상도 JPEG |
+| `POST /api/exports` | 설정 고정, 출력 GPU 버퍼 할당, 실제 해상도의 인코더 시험 후 작업 예약 |
+| `WS /api/exports/{id}/progress` | 작업 시작·상태 구독. 브라우저에서 프레임을 보내지 않음 |
+| `GET /api/exports/{id}` | 진행률·프레임 수·경과·남은 시간·인코더·오류 |
+| `DELETE /api/exports/{id}` | 취소·프로세스 종료·부분 파일 삭제 |
+| `GET /api/exports/{id}/download` | 완성 MP4 스트리밍 다운로드 |
 
-브라우저는 최대 한 프레임의 RGBA 배열과 작은 WebSocket 전송 버퍼만 유지한다. Python은 작은 청크와 FFmpeg 파이프를 처리한다. 원본 프레임 시퀀스를 디스크에 저장하지 않는다.
+예전의 `/frames` 업로드 프로토콜은 제거했다. 영상 작업 스레드가 프레임 번호 `i/fps`로 GPU 작업을 요청한다. 현재 프레임을 FFmpeg가 받는 동안 다음 한 프레임만 미리 그린다. GPU 타깃·읽기 버퍼는 해상도가 같으면 재사용하며, Python의 현재·다음 프레임과 OS 파이프 버퍼만 유지한다. 영상 길이만큼 프레임을 메모리나 디스크에 쌓지 않는다. GPU 읽기와 CPU 메모리·FFmpeg 간 복사는 여전히 존재하며 GPU zero-copy 구조는 아니다.
 
-상태 조회는 `GET /api/exports/{id}`, 취소는 `DELETE /api/exports/{id}`. 상태는 `ready → rendering → encoding → completed`, 또는 `cancelled/error`다. 연결하지 않은 준비 작업은 45초 뒤 정리한다. 연결 종료·잘못된 프레임·저장 공간 부족·인코더 오류는 작업을 종료하고 부분 파일을 삭제한다. 최종 MP4 마무리 중 탭이 닫혀도 종료한다.
+서버당 진행 중인 작업은 하나다. 제작 중 새 미리보기·JPEG는 409로 거절해 전체 해상도 버퍼를 계속 교체하지 않는다. UI는 편집을 잠근다. 상태는 `ready → rendering → encoding → completed`, 또는 `cancelled/error`다. 상태 알림은 약 10Hz로 제한한다. 연결하지 않은 준비 작업은 45초 뒤 정리하며, 탭 연결 종료·GPU·디스크·인코더 오류를 구분해 부분 파일을 삭제한다. 최종 MP4 마무리 중 탭이 닫혀도 종료한다. WebSocket 압축은 끄고 JPEG를 중복 압축하지 않는다.
+
+GPU 인코더는 장치 이름과 실제 출력 크기로 2프레임 시험 인코딩한 결과를 최대 64개 캐시한다. NVIDIA NVENC(p4/HQ/CQ18), Intel QSV(veryfast/global_quality18), AMD AMF(speed/CQP18)를 우선 사용하고 사용할 수 없으면 libx264(medium/CRF18)로 전환한다. 작은 크기·코덱 최대 크기·드라이버 제한도 이 시험으로 처리한다. 하드웨어가 없는 장치에서 시험 성공을 가정하지 않는다.
 
 ## 파일과 실행 수명
 
-FFmpeg는 창을 띄우지 않는 자식 프로세스로 실행한다. RGB 채널 순서를 유지하고, WebGL의 아래부터 읽는 픽셀 순서를 상하 반전한 뒤 yuv420p로 변환한다. 홀수 크기는 가장자리 픽셀을 반복해 짝수 크기로 확장한다. MP4는 `faststart`, H.264 CRF 18 / medium / 무음, BT.709 행렬·색 원색과 sRGB 전달 특성을 기록한다.
+FFmpeg는 창을 띄우지 않는 자식 프로세스로 실행한다. RGB 채널 순서를 유지하고, OpenGL의 아래부터 읽는 픽셀 순서를 상하 반전한 뒤 yuv420p로 변환한다. 홀수 크기는 가장자리 픽셀을 반복해 짝수 크기로 확장한다. MP4는 `faststart`, H.264 / 무음, BT.709 행렬·색 원색과 sRGB 전달 특성을 기록한다. 하드웨어 인코더가 색 필드를 누락하는 경우를 막기 위해 `h264_metadata` 필터로 H.264 VUI도 명시한다. GPU 인코더와 CPU 인코더의 품질 수치는 서로 동등한 척도가 아니다.
 
 임시 영상은 OS 임시 폴더의 서버 세션별 디렉터리에 저장한다. 완성 영상은 서버 종료까지 다시 다운로드할 수 있다. 정상 종료 시 자식 프로세스를 종료하고 세션 폴더를 삭제한다. 강제 프로세스 종료나 전원 차단에서는 OS 임시 폴더에 파일이 남을 수 있다.
 

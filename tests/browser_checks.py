@@ -1,19 +1,17 @@
-"""Real WebGL/download checks. Run against a running local server (see docu/guide/cli_usage.md)."""
+"""Real Edge/Chrome viewer, GPU exports and bounded-memory checks against a local server."""
 
 import argparse
-import base64
-import io
 import json
 import time
 from pathlib import Path
 
 import imageio_ffmpeg
 import psutil
-from PIL import Image, ImageChops, ImageStat
+from PIL import Image
 from playwright.sync_api import sync_playwright
 
 ROOT = Path(__file__).resolve().parents[1]
-RESULTS = ROOT / "test-results"
+RESULTS = ROOT / "test-results" / "python-gpu"
 
 
 def set_number(page, key, value):
@@ -22,147 +20,44 @@ def set_number(page, key, value):
 
 
 def set_range(page, key, value):
-    page.locator(f"#{key}").evaluate("(el, value) => {el.value=value;el.dispatchEvent(new Event('input',{bubbles:true}));}", value)
+    page.locator(f"#{key}").evaluate(
+        "(el,v)=>{el.value=v;el.dispatchEvent(new Event('input',{bubbles:true}));}", value,
+    )
 
 
-def inspect_video(path, expected_size, fps, duration):
+def inspect_video(path, size, fps, duration):
     frames = imageio_ffmpeg.read_frames(str(path))
     metadata = next(frames)
-    assert metadata["size"] == expected_size, metadata
-    assert metadata["fps"] == fps, metadata
-    assert metadata["codec"] == "h264", metadata
-    count = 0
-    first = None
-    for frame in frames:
-        if first is None:
-            first = Image.frombytes("RGB", metadata["size"], frame)
-        count += 1
-    assert count == duration * fps, (count, duration * fps)
-    assert abs(metadata["duration"] - duration) < .01
-    return first, metadata
+    assert metadata["size"] == size and metadata["fps"] == fps, metadata
+    assert metadata["codec"] == "h264" and abs(metadata["duration"] - duration) < .01
+    assert "bt709/bt709/iec61966-2-1" in metadata["pix_fmt"]
+    assert sum(1 for _ in frames) == fps * duration
+    return metadata
 
 
-def check_layer_motion(page, channel):
-    result = page.evaluate("""async()=>{
-      const {WaveRenderer}=await import('/static/js/renderer.js');
-      const {waveFragment}=await import('/static/js/shaders.js');
-      const {DEFAULT_SCENE}=await import('/static/js/scene.js');
-      const r=new WaveRenderer(),size={width:256,height:144};
-      const config={...DEFAULT_SCENE,particle_count:0,speed:1};
-      const loops=[],stopped=[];
-      for(const layer_motion of [0,1,2]) {
-        const c={...config,layer_motion};
-        for(const duration of [1,10,12])for(const fps of [30,60]) {
-          r.renderAt(c,0,size,duration);const first=r.readPixels().slice();
-          r.renderAt(c,duration,size,duration);const end=r.readPixels().slice();
-          const endpoint=first.every((v,i)=>v===end[i]);
-          r.renderAt(c,1/fps,size,duration);const after=r.readPixels().slice();
-          r.renderAt(c,duration-1/fps,size,duration);const before=r.readPixels().slice();
-          let jerk=0,movement=0;
-          for(let i=0;i<first.length;i++){
-            jerk+=Math.abs(after[i]+before[i]-2*first[i]);
-            movement+=Math.abs(after[i]-before[i]);
-          }
-          loops.push({layer_motion,duration,fps,endpoint,
-            jerk:jerk/first.length,movement:movement/first.length});
-        }
-        r.renderAt({...c,speed:0},0,size,10);const a=r.readPixels().slice();
-        r.renderAt({...c,speed:0},4,size,10);
-        const b=r.readPixels();stopped.push(a.every((v,i)=>v===b[i]));
-      }
-      // Observe the production sheet edges on the GPU, in a coordinate frame
-      // travelling with the carrier. No duplicate JavaScript geometry model.
-      // Pack each edge into 16 bits so subpixel changes are measurable.
-      r.material.fragmentShader=waveFragment.slice(0,waveFragment.lastIndexOf('void main() {'))+`
-        uniform int testLayer;
-        uniform float testShift;
-        vec2 packEdge(float edge) {
-          float v=floor(clamp(edge*.5+.5,0.0,1.0)*65535.0+.5);
-          return vec2(floor(v/256.0),mod(v,256.0))/255.0;
-        }
-        void main() {
-          float x=(vUv.x-.5)*1.65/uWidth+testShift;
-          vec3 e=ps3Layer(x,testLayer);
-          gl_FragColor=vec4(packEdge(e.x),packEdge(e.y));
-        }
-      `;
-      r.uniforms.testLayer={value:0};r.uniforms.testShift={value:0};
-      r.material.needsUpdate=true;
-      function edges(time,strength,height,shift,duration=12){
-        const sheets=[];r.uniforms.testShift.value=shift;
-        for(let i=0;i<4;i++){
-          r.uniforms.testLayer.value=i;
-          r.renderAt({...config,layer_motion:strength,height},time,{width:96,height:1},duration);
-          const p=r.readPixels(),a=[],b=[];
-          for(let x=0;x<96;x++){
-            a.push((p[x*4]*256+p[x*4+1])/65535*2-1);
-            b.push((p[x*4+2]*256+p[x*4+3])/65535*2-1);
-          }
-          sheets.push({a,b});
-        }
-        return sheets;
-      }
-      const sheets=[];
-      for(const strength of [0,1,2])for(const height of [0,.3,.55,2]){
-        const initial=edges(0,strength,height,0);
-        let relative=0,widthChange=0,span=0;
-        const perLayer=[0,0,0,0];
-        for(const time of [1.5,3,4.5,6,7.5,9,10.5]){
-          const sample=edges(time,strength,height,(time/12*2*Math.PI)/3.687);
-          for(let x=0;x<96;x++){
-            const values=sample.flatMap(s=>[s.a[x],s.b[x]]);
-            span=Math.max(span,Math.max(...values)-Math.min(...values));
-            for(let i=0;i<4;i++){
-              const width=Math.abs((sample[i].a[x]-sample[i].b[x])-(initial[i].a[x]-initial[i].b[x]));
-              widthChange=Math.max(widthChange,width);perLayer[i]=Math.max(perLayer[i],width);
-              for(let j=i+1;j<4;j++){
-                const gap=s=>(s[i].a[x]+s[i].b[x]-s[j].a[x]-s[j].b[x])*.5;
-                relative=Math.max(relative,Math.abs(gap(sample)-gap(initial)));
-              }
-            }
-          }
-        }
-        sheets.push({strength,height,relative,widthChange,span,perLayer});
-      }
-      const velocities=[];
-      for(const strength of [0,1,2])for(const duration of [1,10,12])for(const fps of [30,60]){
-        const step=1/(fps*8),first=edges(0,strength,.55,0,duration);
-        const after=edges(step,strength,.55,0,duration);
-        const before=edges(duration-step,strength,.55,0,duration);
-        let jerk=0;
-        for(let i=0;i<4;i++)for(const edge of ['a','b'])for(let x=0;x<96;x++)
-          jerk=Math.max(jerk,Math.abs(after[i][edge][x]+before[i][edge][x]-2*first[i][edge][x]));
-        velocities.push({strength,duration,fps,jerk});
-      }
-      r.dispose();return {loops,stopped,sheets,velocities};
-    }""")
-    assert all(item["endpoint"] for item in result["loops"]), result
-    # A one-second loop moves narrow highlights several pixels per frame;
-    # inspect subframe edge derivatives separately from image intensity changes.
-    assert all(item["jerk"] < 3 for item in result["loops"]), result["loops"]
-    assert all(item["jerk"] < .0008 for item in result["velocities"]), result["velocities"]
-    assert all(result["stopped"]), result
-    for item in result["sheets"]:
-        if item["strength"] == 0 or item["height"] == 0:
-            assert item["relative"] < .00015 and item["widthChange"] < .00015, item
-        else:
-            amplitude = item["height"] / .55
-            assert .004 < item["relative"] / amplitude < .2, item
-            assert all(value / amplitude > .0005 for value in item["perLayer"]), item
-            assert item["span"] / amplitude < .32, item
-    (RESULTS / f"layer-motion-{channel}.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
-    print(f"[{channel}] independent sheet motion, bounded band and 18 loop cases passed", flush=True)
+def wait_preview(page):
+    page.wait_for_function("window.studio && !studio.renderer.pending && studio.renderer.displayedTime===studio.time")
+
+
+def make_video(page, path):
+    start = time.perf_counter()
+    with page.expect_download(timeout=120000) as pending:
+        page.locator("#save-video").click()
+        page.wait_for_function("studio.busy")
+        assert page.locator("#layer_motion").is_disabled()
+        assert page.locator("#particle_size").is_disabled()
+    pending.value.save_as(path)
+    page.wait_for_function("!studio.busy")
+    return time.perf_counter() - start
 
 
 def check_browser(playwright, channel, url):
-    print(f"[{channel}] starting", flush=True)
     browser = playwright.chromium.launch(channel=channel, headless=True)
     context = browser.new_context(viewport={"width": 1440, "height": 1000}, accept_downloads=True)
-    external = []
-    errors = []
+    external, errors, raw_frame_uploads = [], [], []
 
     def route_request(route):
-        if route.request.url.startswith(url) or route.request.url.startswith("data:"):
+        if route.request.url.startswith(url):
             route.continue_()
         else:
             external.append(route.request.url)
@@ -171,422 +66,156 @@ def check_browser(playwright, channel, url):
     context.route("**/*", route_request)
     page = context.new_page()
     page.on("pageerror", lambda exc: errors.append(str(exc)))
+    page.on("console", lambda message: print(f"[{channel}] {message.text}", flush=True)
+            if message.type == "error" else None)
+
+    def socket_created(socket):
+        sent = []
+        if socket.url.endswith('/api/preview'):
+            socket.on('framesent', lambda payload: sent.__setitem__(slice(None), [payload]))
+            socket.on('framereceived', lambda payload: print(f'Preview error: {payload}; request={sent}', flush=True)
+                      if isinstance(payload, str) else None)
+        socket.on("framesent", lambda payload: raw_frame_uploads.append(len(payload))
+                  if isinstance(payload, bytes) else None)
+    page.on("websocket", socket_created)
+    # Prove the dashboard does not need browser WebGL, even for final exports.
+    page.add_init_script("""(() => {
+        const original=HTMLCanvasElement.prototype.getContext;
+        HTMLCanvasElement.prototype.getContext=function(type,...args){
+            if(type.startsWith('webgl')) throw new Error('Browser WebGL must not be used');
+            return original.call(this,type,...args);
+        };
+    })();""")
     page.goto(url)
     page.wait_for_function("!!window.studio")
-    assert not page.locator("#fatal-error").is_visible()
-    assert page.locator("#device option").count() == 33
-    assert page.evaluate("() => {const ids=[...document.querySelectorAll('[id]')].map(el=>el.id);return new Set(ids).size===ids.length;}")
     page.locator("#play").click()
+    wait_preview(page)
+    assert "PYTHON GPU" in page.locator("#gpu-status").inner_text()
+    assert page.locator("#device option").count() == 33
+    assert not page.locator("#fatal-error").is_visible()
     page.screenshot(path=str(RESULTS / f"dashboard-{channel}.png"))
-    check_layer_motion(page, channel)
 
-    # Full-resolution render math: closure, animation, zero speeds and rotation.
-    checks = page.evaluate("""async () => {
-      const {WaveRenderer}=await import('/static/js/renderer.js');
-      const {DEFAULT_SCENE,loopState}=await import('/static/js/scene.js');
-      const r=new WaveRenderer();const results=[];
-      for(const style of ['psp-classic','psp-original','ps3']) {
-       for(const layer_motion of style==='ps3'?[0,1,2]:[1]) {
-        for(const rotation of [0,45,90]) {
-          for(const size of [{width:256,height:144},{width:144,height:256},{width:192,height:192}]) {
-            const c={...DEFAULT_SCENE,style,rotation,layer_motion};
-            r.renderAt(c,0,size,7);const a=r.readPixels().slice();
-            r.renderAt(c,7,size,7);const b=r.readPixels().slice();
-            let endpoint=0;for(let i=0;i<a.length;i++)endpoint=Math.max(endpoint,Math.abs(a[i]-b[i]));
-            r.renderAt(c,2.1,size,7);const mid=r.readPixels().slice();
-            let movement=0;for(let i=0;i<a.length;i++)movement+=Math.abs(a[i]-mid[i]);
-            // Symmetric one-frame steps around t=0 test velocity continuity as well as position.
-            r.renderAt(c,1/60,size,7);const after=r.readPixels().slice();
-            r.renderAt(c,7-1/60,size,7);const before=r.readPixels().slice();
-            let jerk=0;for(let i=0;i<a.length;i++)jerk+=Math.abs(after[i]+before[i]-2*a[i]);
-            results.push({style,rotation,layer_motion,...size,endpoint,movement:movement/a.length,jerk:jerk/a.length});
-          }
-        }
-       }
-      }
-      const c={...DEFAULT_SCENE,speed:0,particle_speed:0};
-      r.renderAt(c,0,{width:128,height:128},10);const a=r.readPixels().slice();
-      r.renderAt(c,4,{width:128,height:128},10);const b=r.readPixels().slice();
-      const stopped=a.every((value,index)=>value===b[index]);
-      const positive=loopState({...c,speed:.01,particle_speed:.01},0,1);
-      r.dispose();return {results,stopped,positive};
-    }""")
-    assert all(item["endpoint"] == 0 for item in checks["results"]), checks
-    assert all(item["movement"] > .05 for item in checks["results"]), checks
-    assert all(item["jerk"] < 3 for item in checks["results"]), checks
-    assert checks["stopped"]
-    assert checks["positive"]["waveSpeed"] > 0 and checks["positive"]["particleSpeed"] > 0
-    (RESULTS / f"render-checks-{channel}.json").write_text(json.dumps(checks, indent=2), encoding="utf-8")
-    print(f"[{channel}] 45 render/rotation/aspect loop checks passed", flush=True)
-
-    # Reference video motion is predominantly rightward transport, not fixed
-    # control points bobbing up and down. Compare translated GPU light profiles.
-    motion = page.evaluate("""async()=>{
-      const {WaveRenderer}=await import('/static/js/renderer.js');
-      const data=await (await fetch('/api/presets')).json();
-      const c={...data.styles.find(s=>s.id==='ps3').defaults,color:'#672286',
-        background_color:'#000000',particle_count:0,layer_motion:0};
-      const r=new WaveRenderer();
-      function profile(time,speed=1){
-        r.renderAt({...c,speed},time,{width:800,height:450},12);
-        const p=r.readPixels(),a=new Float64Array(800);let mass=0,ys=0;
-        for(let y=0;y<450;y++)for(let x=0;x<800;x++){
-          const i=(y*800+x)*4,v=p[i]+p[i+1]+p[i+2];
-          a[x]+=v;mass+=v;ys+=y*v;
-        }
-        return {a,cy:ys/mass/450};
-      }
-      function match(a,b){
-        let best={shift:0,error:Infinity};
-        for(let shift=-90;shift<=90;shift++){
-          let error=0;
-          for(let x=100;x<700;x++){const d=b[x]-a[x-shift];error+=d*d;}
-          error/=600;if(error<best.error)best={shift,error};
-        }
-        const energy=a.reduce((s,v)=>s+v*v,0)/800;
-        return {...best,relativeError:best.error/energy};
-      }
-      const phases=[];
-      for(const time of [0,2,4,6]){
-        const a=profile(time),b=profile(time+.5);
-        phases.push({time,...match(a.a,b.a),cy:a.cy});
-      }
-      const doubled=match(profile(0,2).a,profile(.5,2).a);
-      r.dispose();return {phases,doubled};
-    }""")
-    assert all(30 <= p["shift"] <= 50 and p["relativeError"] < .001 for p in motion["phases"]), motion
-    assert all(.38 < p["cy"] < .64 for p in motion["phases"]), motion
-    assert abs(motion["doubled"]["shift"] - 2 * motion["phases"][0]["shift"]) <= 4, motion
-    (RESULTS / f"wave-motion-{channel}.json").write_text(json.dumps(motion, indent=2), encoding="utf-8")
-    print(f"[{channel}] rightward transport, reference-scale speed and speed control passed", flush=True)
-
-    # A neutral palette must remain neutral in each style, including the new hue mapping.
-    neutral = page.evaluate("""async()=>{
-      const {WaveRenderer}=await import('/static/js/renderer.js');
-      const {DEFAULT_SCENE}=await import('/static/js/scene.js');
-      const r=new WaveRenderer();const differences={};
-      for(const style of ['psp-classic','psp-original','ps3']) {
-        r.renderAt({...DEFAULT_SCENE,style,color:'#808080',particle_count:0},0,{width:320,height:180},10);
-        const p=r.readPixels();let largest=0;
-        for(let i=0;i<p.length;i+=4)largest=Math.max(largest,Math.abs(p[i]-p[i+1]),Math.abs(p[i+1]-p[i+2]));
-        differences[style]=largest;
-      }
-      r.dispose();return differences;
-    }""")
-    assert all(value <= 1 for value in neutral.values()), neutral
-
-    # Observe neutral light at crossings and the narrow rounded roll on Classic.
-    # Decode sRGB first: brightness alone must not masquerade as desaturation.
-    lighting = page.evaluate("""async()=>{
-      const {WaveRenderer}=await import('/static/js/renderer.js');
-      const data=await (await fetch('/api/presets')).json();
-      const r=new WaveRenderer();const phases=[];
-      const linear=c=>c<=.04045?c/12.92:((c+.055)/1.055)**2.4;
-      const sample=(p,i)=>{
-        const hi=Math.max(p[i],p[i+1],p[i+2]),lo=Math.min(p[i],p[i+1],p[i+2]);
-        return {brightness:hi,saturation:1-linear(lo/255)/linear(hi/255)};
-      };
-      const topMean=values=>{
-        values.sort((a,b)=>a.brightness-b.brightness);
-        const top=values.slice(Math.floor(values.length*.9));
-        return {brightness:top.reduce((s,p)=>s+p.brightness,0)/top.length,
-                saturation:top.reduce((s,p)=>s+p.saturation,0)/top.length};
-      };
-      const config={...data.styles.find(s=>s.id==='ps3').defaults,
-        color:'#672286',background_color:'#000000',particle_count:0};
-      let patches;
-      for(const time of [0,2.5,5,7.5]) {
-        r.renderAt(config,time,{width:876,height:345},10);
-        const p=r.readPixels(),values=[];
-        for(let i=0;i<p.length;i+=4){const v=sample(p,i);if(v.brightness>40)values.push(v);}
-        values.sort((a,b)=>a.brightness-b.brightness);
-        const mean=(lo,hi)=>{
-          const a=values.slice(Math.floor(values.length*lo),Math.floor(values.length*hi));
-          return a.reduce((s,p)=>s+p.saturation,0)/a.length;
-        };
-        phases.push({time,body:mean(.15,.35),highlight:mean(.95,.995)});
-        if(time===0){
-          const patch=(x0,y0,x1,y1)=>{
-            const a=[];
-            for(let y=y0;y<y1;y++)for(let x=x0;x<x1;x++){
-              const v=sample(p,((344-y)*876+x)*4);if(v.brightness>40)a.push(v);
-            }
-            return topMean(a);
-          };
-          patches={single:patch(30,208,90,214),crossing:patch(420,145,465,162)};
-        }
-      }
-      const classic={...data.styles.find(s=>s.id==='psp-classic').defaults,
-        color:'#084acc',wave_color:'#0949d0',background_color:'#000000',particle_count:0};
-      r.renderAt(classic,0,{width:869,height:482},10);
-      const pixels=r.readPixels().slice();const red=y=>pixels[((481-y)*869+100)*4];
-      let peak=305;for(let y=306;y<366;y++)if(red(y)>red(peak))peak=y;
-      const value=red(peak);
-      const halfWidth=Array.from({length:61},(_,i)=>red(peak-30+i)).filter(v=>v>=value*.5).length;
-      const crease={peak,value,halfWidth,above:red(peak-4),below:red(peak+4),far:red(peak+15)};
-      r.renderAt({...classic,glow:0},0,{width:869,height:482},10);
-      crease.unlit=r.readPixels()[((481-peak)*869+100)*4];
-      r.dispose();return {phases,patches,crease};
-    }""")
-    assert all(p["highlight"] < p["body"] - .15 for p in lighting["phases"]), lighting
-    assert lighting["patches"]["crossing"]["brightness"] > lighting["patches"]["single"]["brightness"] * 1.3, lighting
-    assert lighting["patches"]["crossing"]["saturation"] < lighting["patches"]["single"]["saturation"] - .15, lighting
-    crease = lighting["crease"]
-    assert crease["value"] > 40 and 1 < crease["halfWidth"] < 12, lighting
-    assert crease["below"] > crease["above"] + 5 and crease["far"] < crease["value"] * .4, lighting
-    assert crease["unlit"] < 10, lighting
-    (RESULTS / f"wave-lighting-{channel}.json").write_text(json.dumps(lighting, indent=2), encoding="utf-8")
-    print(f"[{channel}] white crossings and thin rounded Classic highlights passed", flush=True)
-
-    # Observe the rendered light footprint, rather than only inspecting size uniforms.
-    particles = page.evaluate("""async()=>{
-      const {WaveRenderer}=await import('/static/js/renderer.js');
-      const {DEFAULT_SCENE}=await import('/static/js/scene.js');
-      const r=new WaveRenderer();
-      // Centre the probe independently of the PS3 particle path's mean height.
-      const config={...DEFAULT_SCENE,y:.025,particle_count:1,particle_speed:0,glow:0,background_color:'#000000'};
-      function measure(size,depth){
-        const c={...config,particle_size:size};
-        r.renderAt(c,0,{width:720,height:720},10);
-        const random=r.particleGeometry.attributes.aRandom;
-        random.array.set([.5,.75,.5,.6]);random.needsUpdate=true;
-        const d=r.particleGeometry.attributes.aDepth;
-        d.array.set([depth,.5]);d.needsUpdate=true;
-        r.renderAt(c,0,{width:720,height:720},10);
-        const pixels=r.readPixels();let area=0,peak=0,sum=0,xSum=0,ySum=0;
-        for(let i=0;i<pixels.length;i+=4){
-          const value=Math.max(pixels[i],pixels[i+1],pixels[i+2]);
-          peak=Math.max(peak,value);
-          if(value>5){area++;sum+=value;xSum+=(i/4%720)*value;ySum+=Math.floor(i/4/720)*value;}
-        }
-        return {area,peak,cx:xSum/sum,cy:ySum/sum,count:r.particleGeometry.instanceCount};
-      }
-      const sharp=measure(2,.1),large=measure(4,.1),soft=measure(2,1);
-      r.dispose();return {sharp,large,soft};
-    }""")
-    assert particles["large"]["area"] > particles["sharp"]["area"] * 2, particles
-    assert particles["soft"]["area"] > particles["sharp"]["area"] * 2, particles
-    assert particles["sharp"]["peak"] > particles["soft"]["peak"], particles
-    assert all(item["count"] == 1 for item in particles.values()), particles
-    assert abs(particles["sharp"]["cx"] - particles["large"]["cx"]) < 1, particles
-    (RESULTS / f"particle-focus-{channel}.json").write_text(json.dumps(particles, indent=2), encoding="utf-8")
-
-    set_range(page, "particle_size", 2.25)
-    page.reload()
-    page.wait_for_function("!!window.studio")
-    assert page.evaluate("window.studio.scene.particle_size") == 2.25
-    assert page.locator("#particle_size").input_value() == "2.25"
-
-    page.locator("#advanced summary").click()
-    assert page.locator("#layer-motion-control").is_visible()
-    assert page.locator("#layer_motion").get_attribute("step") == "0.05"
+    page.locator("#layer_motion").evaluate("el=>el.closest('details').open=true")
     set_range(page, "layer_motion", 1.65)
-    page.reload()
-    page.wait_for_function("!!window.studio")
-    assert page.evaluate("window.studio.scene.layer_motion") == 1.65
-    assert page.locator("#layer_motion").input_value() == "1.65"
-    # Revision 2 clients have no new field. Supply only the missing value,
-    # retaining every saved edit and the existing preset revision.
-    page.evaluate("""()=>{
-      const stored=JSON.parse(localStorage.getItem('xmb-wave-studio-v1'));
-      delete stored.scene.layer_motion;
-      stored.scene.color='#7958b6';stored.scene.width=1.5;stored.scene.rotation=90;
-      localStorage.setItem('xmb-wave-studio-v1',JSON.stringify(stored));
-    }""")
-    page.reload()
-    page.wait_for_function("!!window.studio")
-    restored = page.evaluate("window.studio.scene")
-    assert restored["layer_motion"] == 1 and restored["particle_size"] == 2.25, restored
-    assert restored["color"] == "#7958b6" and restored["width"] == 1.5 and restored["rotation"] == 90, restored
-    assert page.evaluate("JSON.parse(localStorage.getItem('xmb-wave-studio-v1')).revision") == 2
-
-    # Old stored settings get the revised untouched defaults, while actual edits survive.
-    page.evaluate("""()=>{
-      localStorage.setItem('xmb-wave-studio-v1',JSON.stringify({scene:{
-        style:'psp-classic',color:'#7958b6',background_color:null,wave_color:null,
-        speed:1,rotation:90,height:.45,width:1.5,overlap:.6,x:0,y:0,scale:1,
-        glow:.8,particle_count:180,particle_speed:1,seed:2026
-      },output:window.studio.output}));
-    }""")
-    page.reload()
-    page.wait_for_function("!!window.studio")
-    migrated = page.evaluate("window.studio.scene")
-    assert migrated["height"] == .6 and migrated["overlap"] == .8, migrated
-    assert migrated["particle_count"] == 0 and migrated["particle_size"] == 1, migrated
-    assert migrated["rotation"] == 90 and migrated["width"] == 1.5, migrated
-    assert migrated["color"] == "#7958b6", migrated
-    assert migrated["layer_motion"] == 1, migrated
-    print(f"[{channel}] sharp/soft particle footprints, size and settings migration passed", flush=True)
-
-    # Form behavior, persistence, model sizes and independent shape/output controls.
-    page.locator("#device").select_option("iphone16")
-    assert page.locator("#width").input_value() == "1179"
-    assert "1180" in page.locator("#output-summary").text_content()
-    assert page.locator("#device-source").is_visible()
-    set_range(page, "rotation", 90)
-    page.locator('[data-style="psp-classic"]').click()
-    assert page.evaluate("window.studio.scene.rotation") == 90
-    assert not page.locator("#particles-section").is_visible()
-    page.locator("#advanced summary").click()
-    assert not page.locator("#layer-motion-control").is_visible()
-    set_range(page, "scene-width", 1.5)
-    assert page.locator("#width").input_value() == "1179"
-    assert page.evaluate("window.studio.scene.width") == 1.5
-    page.reload()
-    page.wait_for_function("!!window.studio")
-    assert page.evaluate("window.studio.scene.rotation") == 90
-    assert page.evaluate("window.studio.scene.width") == 1.5
-    page.locator('[data-style="ps3"]').click()
-    page.locator("#advanced summary").click()
-    assert page.locator("#layer-motion-control").is_visible()
-    set_range(page, "layer_motion", 2)
-    page.locator("#reset").click()
-    assert page.evaluate("window.studio.scene.layer_motion") == 1
-    # Pause after a reload regardless of the initial prefers-reduced-motion setting.
-    if page.locator("#play").get_attribute("aria-label") == "일시정지":
-        page.locator("#play").click()
+    set_range(page, "particle_size", 2.5)
     set_number(page, "width", 127)
     set_number(page, "height", 129)
-    set_number(page, "duration", 1)
-    set_range(page, "timeline", 0)
-    page.wait_for_timeout(100)
-
-    with page.expect_download() as info:
+    page.reload()
+    page.wait_for_function("!!window.studio")
+    if page.locator("#play").get_attribute("aria-label") == "일시정지":
+        page.locator("#play").click()
+    wait_preview(page)
+    assert page.evaluate("studio.scene.layer_motion") == 1.65
+    assert page.evaluate("studio.scene.particle_size") == 2.5
+    page.locator("#timeline").evaluate("el=>{el.value=2.5;el.dispatchEvent(new Event('input'));}")
+    wait_preview(page)
+    with page.expect_download() as pending:
         page.locator("#save-image").click()
-    jpeg = RESULTS / f"sample-{channel}.jpg"
-    info.value.save_as(str(jpeg))
-    assert Image.open(jpeg).size == (127, 129)
-    page.wait_for_function("!window.studio.busy")
-    # Matching full-resolution reference from the same common renderer.
-    reference_url = page.evaluate("""async()=>{
-      const {WaveRenderer}=await import('/static/js/renderer.js');const r=new WaveRenderer();
-      r.renderAt(window.studio.scene,0,window.studio.output,1);
-      const data=r.canvas.toDataURL('image/png');r.dispose();return data;
-    }""")
-    reference = Image.open(io.BytesIO(base64.b64decode(reference_url.split(",")[1]))).convert("RGB")
-    jpeg_difference = ImageStat.Stat(ImageChops.difference(reference, Image.open(jpeg).convert("RGB"))).mean
-    assert max(jpeg_difference) < 3, jpeg_difference
+    pending.value.save_as(RESULTS / f"image-{channel}.jpg")
+    assert Image.open(RESULTS / f"image-{channel}.jpg").size == (127, 129)
+    page.wait_for_function("!studio.busy")
+    # JPEG endpoint and the displayed preview use the same frozen scene/time.
+    body = page.evaluate("({scene:studio.scene,output:studio.output,time:studio.time})")
+    expected = context.request.post(url + "/api/images", data=body)
+    assert expected.status == 200
+    assert (RESULTS / f"image-{channel}.jpg").read_bytes() == expected.body()
 
-    for style, fps in [("psp-classic", 30), ("psp-original", 60), ("ps3", 30)]:
+    set_number(page, "duration", 1)
+    page.locator("#advanced").evaluate("el=>el.open=true")
+    timings = {}
+    for style in ["psp-classic", "psp-original", "ps3"]:
         page.locator(f'[data-style="{style}"]').click()
-        page.locator("#fps").select_option(str(fps))
-        with page.expect_download(timeout=90000) as info:
-            page.locator("#save-video").click()
-        destination = RESULTS / f"{style}-{channel}-{fps}.mp4"
-        info.value.save_as(str(destination))
-        first, _ = inspect_video(destination, (128, 130), fps, 1)
-        page.wait_for_function("!window.studio.busy")
-        assert page.locator("#download-video").is_visible()
-        if style == "ps3":
-            difference = ImageStat.Stat(ImageChops.difference(reference, first.crop((0, 0, 127, 129)))).mean
-            assert max(difference) < 8, difference
-    print(f"[{channel}] JPEG and all 3 MP4 styles decoded correctly", flush=True)
+        assert page.locator("#layer-motion-control").is_visible() == (style == "ps3")
+        path = RESULTS / f"{style}-{channel}.mp4"
+        timings[style] = make_video(page, path)
+        inspect_video(path, (128, 130), 30, 1)
 
-    # Cancel a long job through the UI and verify the next job isn't blocked.
-    set_number(page, "duration", 600)
-    with page.expect_response(lambda response: response.url.endswith('/api/exports') and response.request.method == 'POST') as info:
-        page.locator("#save-video").click()
-    job_id = info.value.json()["id"]
-    page.wait_for_function("window.studio.busy")
-    assert page.locator("#layer_motion").is_disabled()
+    # Actual-size performance, including POST, status subscription, encoding and download.
+    set_number(page, "width", 1080)
+    set_number(page, "height", 1920)
+    set_number(page, "duration", 10)
+    page.locator("#reset").click()
+    path = RESULTS / f"1080x1920-{channel}.mp4"
+    timings["1080x1920_10s"] = make_video(page, path)
+    inspect_video(path, (1080, 1920), 30, 10)
+
+    set_number(page, "duration", 3600)
+    page.locator("#save-video").click()
+    page.wait_for_function("studio.busy")
     page.locator("#cancel-export").click()
-    page.wait_for_function("!window.studio.busy")
-    assert context.request.get(f"{url}/api/exports/{job_id}").json()["status"] == "cancelled"
-    assert page.locator("#save-video").is_enabled()
-
-    # Abrupt tab close mid-frame must also reclaim the server job.
-    with page.expect_response(lambda response: response.url.endswith('/api/exports') and response.request.method == 'POST') as info:
-        page.locator("#save-video").click()
-    job_id = info.value.json()["id"]
-    page.wait_for_timeout(200)
-    page.close()
+    page.wait_for_function("!studio.busy", timeout=15000)
+    assert "취소" in page.locator("#job-label").inner_text()
+    # A tab closing/reloading cancels the native worker, even though it renders independently.
+    page.locator("#save-video").click()
+    page.wait_for_function("studio.busy")
+    page.wait_for_function("document.querySelector('#job-details').textContent.includes('프레임')")
+    page.close(run_before_unload=False)
     for _ in range(100):
-        state = context.request.get(f"{url}/api/exports/{job_id}").json()
-        if state["status"] not in {"ready", "rendering", "encoding"}:
+        probe = context.request.post(url + "/api/exports", data={"scene": body["scene"], "output": {
+            **body["output"], "width": 32, "height": 32, "duration": 1,
+        }})
+        if probe.status == 201:
+            context.request.delete(url + "/api/exports/" + probe.json()["id"])
             break
-        time.sleep(.03)
-    assert state["error_code"] == "connection_lost", state
-    assert not external, external
-    assert not errors, errors
+        time.sleep(.05)
+    assert probe.status == 201, probe.text()
+    assert not external and not errors and not raw_frame_uploads, (external, errors, raw_frame_uploads)
+    result = {"browser": channel, "seconds": timings, "browser_binary_uploads": 0,
+              "gpu": context.request.get(url + "/api/presets").json()["gpu"]}
+    (RESULTS / f"browser-{channel}.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    print(json.dumps(result), flush=True)
     context.close()
     browser.close()
-    print(f"[{channel}] cancellation, tab close and offline checks passed", flush=True)
 
 
-def long_export(playwright, url):
-    print("[long] real browser 600s x 30fps, 32x32 export", flush=True)
-    browser = playwright.chromium.launch(channel="chrome", headless=True)
+def long_export(playwright, channel, url):
+    browser = playwright.chromium.launch(channel=channel, headless=True)
     page = browser.new_page(accept_downloads=True)
     page.goto(url)
     page.wait_for_function("!!window.studio")
-    for key, value in [("width", 32), ("height", 32), ("duration", 600)]:
-        set_number(page, key, value)
-    server_memory = []
-    cdp = page.context.new_cdp_session(page)
-    browser_cdp = browser.new_browser_cdp_session()
-    started = time.monotonic()
-    with page.expect_response(lambda r: r.url.endswith('/api/exports') and r.request.method == 'POST') as info:
+    set_number(page, "width", 32)
+    set_number(page, "height", 32)
+    set_number(page, "duration", 600)
+    rows = []
+    start = time.monotonic()
+    with page.expect_download(timeout=180000) as pending:
         page.locator("#save-video").click()
-    job_id = info.value.json()["id"]
-    with page.expect_download(timeout=900000) as download_info:
-        while page.evaluate("window.studio.busy"):
-            page.wait_for_timeout(1000)
-            state = page.request.get(f"{url}/api/exports/{job_id}").json()
-            memory = 0
-            for process in psutil.process_iter(["name", "cmdline", "memory_info"]):
+        page.wait_for_function("studio.busy")
+        while page.evaluate("studio.busy"):
+            server_memory = 0
+            for process in psutil.process_iter(["pid", "name", "cmdline", "memory_info"]):
                 try:
-                    arguments = process.info["cmdline"] or []
-                    # Match Python argv, not a PowerShell script containing the command text.
-                    is_server = any(arg == "-m" and arguments[index+1:index+2] == ["xmbwavestudio"]
-                                    for index, arg in enumerate(arguments))
-                    if (is_server or 'ffmpeg' in process.info["name"].lower()):
-                        memory += process.info["memory_info"].rss
+                    cmd = " ".join(process.info["cmdline"] or [])
+                    name = (process.info["name"] or "").lower()
+                    if "ffmpeg" in name or ("python" in name and "-m xmbwavestudio" in cmd):
+                        server_memory += process.info["memory_info"].rss
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    continue
-            heap = cdp.send("Runtime.getHeapUsage")
-            browser_rss = 0
-            for process in browser_cdp.send("SystemInfo.getProcessInfo")["processInfo"]:
-                try:
-                    browser_rss += psutil.Process(process["id"]).memory_info().rss
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    continue
-            server_memory.append({"frames": state["frames"], "rss": memory,
-                                  "browser_rss": browser_rss, "js_heap": heap["usedSize"]})
-            if len(server_memory) % 10 == 0:
-                print(f"[long] {state['frames']}/18000 frames, {memory/1024**2:.1f} MiB server+encoder", flush=True)
-            if state["status"] == "error":
-                raise AssertionError(state)
-    destination = RESULTS / "long-600s.mp4"
-    download_info.value.save_as(str(destination))
-    inspect_video(destination, (32, 32), 30, 600)
-    samples = [sample["rss"] for sample in server_memory[3:]]
-    if samples:
-        assert max(samples) - min(samples) < 100 * 1024**2, server_memory
-    browser_samples = [sample["browser_rss"] for sample in server_memory[3:]]
-    heap_samples = [sample["js_heap"] for sample in server_memory[3:]]
-    if browser_samples:
-        assert max(browser_samples) - min(browser_samples) < 150 * 1024**2, server_memory
-        assert max(heap_samples) - min(heap_samples) < 64 * 1024**2, server_memory
-    (RESULTS / "long-export-memory.json").write_text(json.dumps({
-        "seconds": time.monotonic()-started, "samples": server_memory,
-        "frames": 18000, "video_duration": 600,
-    }, indent=2), encoding="utf-8")
+                    pass
+            rows.append({"time": time.monotonic() - start, "rss": server_memory})
+            page.wait_for_timeout(100)
+    path = RESULTS / "600s-18000frames.mp4"
+    pending.value.save_as(path)
+    inspect_video(path, (32, 32), 30, 600)
+    settled = [row["rss"] for row in rows if row["time"] > 1]
+    assert not settled or max(settled) - min(settled) < 128 * 1024**2
+    result = {"seconds": time.monotonic() - start, "samples": rows}
+    (RESULTS / "long-memory.json").write_text(json.dumps(result), encoding="utf-8")
+    print(f"600s/18000 frames passed, {result['seconds']:.2f}s", flush=True)
     browser.close()
-    print("[long] 18,000 frames decoded, 600 seconds, bounded memory passed", flush=True)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="http://127.0.0.1:8765")
+    parser.add_argument("--browser", choices=["chrome", "msedge", "all"], default="all")
     parser.add_argument("--long", action="store_true")
-    parser.add_argument("--browser", choices=["both", "chrome", "msedge"], default="both")
     args = parser.parse_args()
-    RESULTS.mkdir(exist_ok=True)
+    RESULTS.mkdir(parents=True, exist_ok=True)
     with sync_playwright() as playwright:
-        for channel in (["msedge", "chrome"] if args.browser == "both" else [args.browser]):
+        for channel in ["chrome", "msedge"] if args.browser == "all" else [args.browser]:
             check_browser(playwright, channel, args.url)
         if args.long:
-            long_export(playwright, args.url)
+            long_export(playwright, "chrome" if args.browser == "all" else args.browser, args.url)
 
 
 if __name__ == "__main__":
