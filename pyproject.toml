@@ -12,16 +12,19 @@ dependencies = [
     "uvicorn>=0.34,<1",
     "websockets>=14,<17",
     "imageio-ffmpeg>=0.6,<0.7",
+    "moderngl>=5.12,<6",
+    "numpy>=2,<3",
+    "pillow>=11,<14",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "httpx>=0.28", "pillow>=11", "playwright>=1.51", "psutil>=6", "ruff>=0.11"]
+dev = ["pytest>=8", "httpx>=0.28", "playwright>=1.51", "psutil>=6", "ruff>=0.11"]
 
 [tool.setuptools.packages.find]
 include = ["xmbwavestudio*"]
 
 [tool.setuptools.package-data]
-xmbwavestudio = ["data/*.json", "static/*", "static/js/*", "static/vendor/*"]
+xmbwavestudio = ["data/*.json", "gpu/*.vert", "gpu/*.frag", "static/*", "static/js/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

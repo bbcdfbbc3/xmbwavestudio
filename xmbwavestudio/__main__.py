@@ -57,6 +57,7 @@ def main():
             create_app(), host="127.0.0.1", port=args.port, log_level="info",
             ws_max_size=2 * 1024 * 1024, ws_max_queue=2, ws_ping_interval=20,
             ws_ping_timeout=120, timeout_graceful_shutdown=3,
+            ws_per_message_deflate=False,
         )
         uvicorn.Server(config).run(sockets=[server_socket])
     except KeyboardInterrupt:

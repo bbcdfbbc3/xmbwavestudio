@@ -1,4 +1,4 @@
-"""Loopback-only editor and frame-streaming API."""
+"""Loopback editor: Python owns rendering; browsers receive only previews and status."""
 
 import asyncio
 import contextlib
@@ -8,20 +8,22 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from pydantic import ValidationError
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from . import __version__
-from .exports import ACTIVE_STATES, CHUNK_SIZE, ExportManager
-from .models import STYLE_PRESETS, ExportRequest
+from .exports import ACTIVE_STATES, ExportManager
+from .models import STYLE_PRESETS, ExportRequest, ImageRequest, PreviewRequest
+from .rendering import RenderService
 
 PACKAGE = Path(__file__).resolve().parent
 
 
 def same_origin(origin: str | None, host: str | None) -> bool:
     if not origin:
-        return True  # Non-browser clients, including local tests.
+        return True
     parsed = urlsplit(origin)
     return parsed.scheme in {"http", "https"} and parsed.netloc == host
 
@@ -29,7 +31,9 @@ def same_origin(origin: str | None, host: str | None) -> bool:
 def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        manager = await asyncio.to_thread(ExportManager)
+        renderer = await asyncio.to_thread(RenderService)
+        manager = await asyncio.to_thread(ExportManager, renderer)
+        app.state.renderer = renderer
         app.state.exports = manager
 
         async def reap():
@@ -45,6 +49,7 @@ def create_app() -> FastAPI:
             with contextlib.suppress(asyncio.CancelledError):
                 await reaper
             await asyncio.to_thread(manager.close)
+            await asyncio.to_thread(renderer.close)
 
     app = FastAPI(title="XMB Wave Studio", version=__version__, lifespan=lifespan)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1", "testserver"])
@@ -68,6 +73,24 @@ def create_app() -> FastAPI:
             raise HTTPException(404, "해당 제작 작업을 찾을 수 없습니다.")
         return job
 
+    async def image_bytes(request: ImageRequest, preview=False):
+        if app.state.exports.active:
+            raise HTTPException(409, "영상 제작이 끝난 뒤 미리보기와 이미지를 만들 수 있습니다.")
+        output = request.output
+        width, height = ((request.width, request.height) if preview
+                         else (output.width, output.height))
+        format = request.format.upper() if preview else "JPEG"
+        try:
+            future = app.state.renderer.submit(
+                "image", request.scene, request.time, width, height, output.duration,
+                (output.width, output.height), format,
+            )
+            return await asyncio.wrap_future(future)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(503, str(exc)) from exc
+
     @app.get("/api/health")
     async def health():
         return {"app": "xmbwavestudio", "version": __version__}
@@ -80,20 +103,55 @@ def create_app() -> FastAPI:
             "styles": STYLE_PRESETS, "devices": devices,
             "palette": ["#3264c5", "#7958b6", "#ca6ba1", "#c44243", "#d5833b", "#b9a058",
                         "#6a9f58", "#408d86", "#425f97", "#758598", "#b9b9b9", "#252535"],
-            "encoder": {"available": bool(manager.executable), "error": manager.encoder_error},
-            "version": __version__,
+            "encoder": {"available": bool(manager.executable), "error": manager.encoder_error,
+                        "name": manager.default_encoder,
+                        "hardware": manager.default_encoder not in {None, "libx264"}},
+            "gpu": app.state.renderer.info, "version": __version__,
         }
+
+    @app.post("/api/images")
+    async def image(request: ImageRequest):
+        data = await image_bytes(request)
+        output = request.output
+        filename = f"xmb-{request.scene.style}-{output.width}x{output.height}.jpg"
+        return Response(data, media_type="image/jpeg", headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+        })
+
+    @app.post("/api/preview")
+    async def preview(request: PreviewRequest):
+        return Response(await image_bytes(request, preview=True),
+                        media_type=f"image/{request.format}")
+
+    @app.websocket("/api/preview")
+    async def live_preview(websocket: WebSocket):
+        if not same_origin(websocket.headers.get("origin"), websocket.headers.get("host")):
+            await websocket.close(code=1008)
+            return
+        await websocket.accept()
+        try:
+            while True:
+                try:
+                    request = PreviewRequest.model_validate(await websocket.receive_json())
+                    await websocket.send_bytes(await image_bytes(request, preview=True))
+                except (ValidationError, HTTPException, ValueError, TypeError, KeyError) as exc:
+                    await websocket.send_json({"error": str(exc.detail) if isinstance(
+                        exc, HTTPException) else "미리보기 입력값을 확인해 주세요."})
+        except (WebSocketDisconnect, RuntimeError):
+            pass
 
     @app.post("/api/exports", status_code=201)
     async def create_export(request: ExportRequest):
         if request.output.kind != "video":
-            raise HTTPException(422, "이 API는 영상 제작용입니다. JPEG는 브라우저에서 저장합니다.")
+            raise HTTPException(422, "JPEG는 /api/images에서 저장합니다.")
         try:
-            job = app.state.exports.create(request)
+            job = await asyncio.to_thread(app.state.exports.create, request)
         except ValueError as exc:
-            raise HTTPException(409, str(exc)) from exc
+            raise HTTPException(409 if app.state.exports.active else 422, str(exc)) from exc
         except RuntimeError as exc:
             raise HTTPException(503, str(exc)) from exc
+        except OSError as exc:
+            raise HTTPException(507, "영상 작업을 만들 수 없습니다. 임시 폴더와 디스크 공간을 확인해 주세요.") from exc
         return job.snapshot()
 
     @app.get("/api/exports/{job_id}")
@@ -116,8 +174,8 @@ def create_app() -> FastAPI:
         filename = f"xmb-{job.request.scene.style}-{width}x{height}-{output.duration}s.mp4"
         return FileResponse(job.path, media_type="video/mp4", filename=filename)
 
-    @app.websocket("/api/exports/{job_id}/frames")
-    async def frames(websocket: WebSocket, job_id: str):
+    @app.websocket("/api/exports/{job_id}/progress")
+    async def progress(websocket: WebSocket, job_id: str):
         if not same_origin(websocket.headers.get("origin"), websocket.headers.get("host")):
             await websocket.close(code=1008)
             return
@@ -127,67 +185,27 @@ def create_app() -> FastAPI:
             return
         job.connected = True
         await websocket.accept()
+        disconnect = asyncio.create_task(websocket.receive())
         try:
-            await asyncio.to_thread(job.start)
-            await websocket.send_json({"type": "ready", "chunk_size": CHUNK_SIZE, **job.snapshot()})
-            output = job.request.output
-            frame_bytes = output.width * output.height * 4
-            for index in range(output.frame_count):
-                message = await websocket.receive()
-                if message["type"] == "websocket.disconnect":
-                    raise WebSocketDisconnect()
-                if not isinstance(message.get("text"), str):
-                    raise TypeError("프레임 헤더는 JSON 텍스트여야 합니다.")
-                header = json.loads(message["text"])
-                if not isinstance(header, dict):
-                    raise TypeError("프레임 헤더가 올바르지 않습니다.")
-                if header.get("type") != "frame" or type(header.get("index")) is not int or (
-                    header["index"] != index
-                ):
-                    raise ValueError("프레임 순서가 일치하지 않습니다.")
-                remaining = frame_bytes
-                while remaining:
-                    message = await websocket.receive()
-                    if message["type"] == "websocket.disconnect":
-                        raise WebSocketDisconnect()
-                    chunk = message.get("bytes")
-                    if not chunk or len(chunk) > min(CHUNK_SIZE, remaining):
-                        raise ValueError("프레임 데이터 크기가 올바르지 않습니다.")
-                    await asyncio.to_thread(job.write, chunk)
-                    remaining -= len(chunk)
-                job.frames += 1
-                await websocket.send_json({"type": "ack", "index": index, **job.snapshot()})
-            await websocket.send_json({"type": "encoding", **job.snapshot()})
-
-            # A tab closing during MP4 finalization must also stop the encoder.
-            finishing = asyncio.create_task(asyncio.to_thread(job.finish))
-            disconnect = asyncio.create_task(websocket.receive())
-            try:
-                done, _ = await asyncio.wait(
-                    {finishing, disconnect}, return_when=asyncio.FIRST_COMPLETED
-                )
-                if disconnect in done:
-                    await asyncio.to_thread(
-                        job.stop, "브라우저 연결이 종료되어 제작을 중단했습니다.", "connection_lost"
-                    )
-                    await finishing
-                    return
-                await finishing
-            finally:
-                disconnect.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await disconnect
-            await websocket.send_json({"type": "completed", **job.snapshot()})
-        except WebSocketDisconnect:
-            await asyncio.to_thread(
-                job.stop, "브라우저 연결이 종료되어 제작을 중단했습니다.", "connection_lost"
-            )
-        except (OSError, RuntimeError, ValueError, TypeError) as exc:
-            if job.status in ACTIVE_STATES:
-                await asyncio.to_thread(job.fail, exc)
-            with contextlib.suppress(Exception):
-                await websocket.send_json({"type": "error", **job.snapshot()})
+            await websocket.send_json({"type": "ready", **job.snapshot()})
+            job.launch(app.state.renderer)
+            while True:
+                snapshot = job.snapshot()
+                await websocket.send_json({"type": snapshot["status"], **snapshot})
+                if snapshot["status"] not in ACTIVE_STATES:
+                    break
+                done, _ = await asyncio.wait({disconnect}, timeout=.1)
+                if done:
+                    await asyncio.to_thread(job.stop,
+                                            "브라우저 연결이 종료되어 제작을 중단했습니다.",
+                                            "connection_lost")
+                    break
+        except (WebSocketDisconnect, OSError, RuntimeError):
+            await asyncio.to_thread(job.stop, "브라우저 연결이 종료되었습니다.", "connection_lost")
         finally:
+            disconnect.cancel()
+            with contextlib.suppress(asyncio.CancelledError, WebSocketDisconnect):
+                await disconnect
             if job.status in ACTIVE_STATES:
                 await asyncio.to_thread(job.stop)
             with contextlib.suppress(Exception):

@@ -1,4 +1,4 @@
-"""Bounded frame streaming into one local FFmpeg process per export."""
+"""Native GPU frames piped directly to FFmpeg, with at most two frames in flight."""
 
 import errno
 import os
@@ -9,6 +9,7 @@ import threading
 import time
 import uuid
 from collections import deque
+from functools import lru_cache
 from pathlib import Path
 
 import imageio_ffmpeg
@@ -16,7 +17,12 @@ import imageio_ffmpeg
 from .models import ExportRequest
 
 ACTIVE_STATES = {"ready", "rendering", "encoding"}
-CHUNK_SIZE = 1024 * 1024
+ENCODERS = {
+    "h264_nvenc": ["-preset", "p4", "-tune", "hq", "-rc", "vbr", "-cq", "18", "-b:v", "0"],
+    "h264_qsv": ["-preset", "veryfast", "-global_quality", "18"],
+    "h264_amf": ["-quality", "speed", "-rc", "cqp", "-qp_i", "18", "-qp_p", "18"],
+    "libx264": ["-preset", "medium", "-crf", "18"],
+}
 
 
 def hidden_process_options() -> dict:
@@ -37,11 +43,33 @@ def check_encoder() -> tuple[str | None, str | None]:
         return None, f"FFmpeg를 실행할 수 없습니다: {exc}"
 
 
+@lru_cache(maxsize=64)
+def select_encoder(executable, width, height, device, preference="auto"):
+    """Probe actual hardware and dimensions, not just the FFmpeg encoder listing."""
+    name = device.lower()
+    candidate = ("h264_nvenc" if "nvidia" in name else "h264_qsv" if "intel" in name
+                 else "h264_amf" if "amd" in name or "radeon" in name else None)
+    if preference == "auto" and candidate:
+        try:
+            result = subprocess.run([
+                executable, "-hide_banner", "-loglevel", "error", "-nostdin",
+                "-f", "lavfi", "-i", f"color=size={width}x{height}:rate=30",
+                "-frames:v", "2", "-an", "-c:v", candidate, *ENCODERS[candidate],
+                "-pix_fmt", "yuv420p", "-f", "null", "-",
+            ], check=False, capture_output=True, timeout=15, **hidden_process_options())
+            if result.returncode == 0:
+                return candidate
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return "libx264"
+
+
 class ExportJob:
-    def __init__(self, request: ExportRequest, root: Path, executable: str):
+    def __init__(self, request: ExportRequest, root: Path, executable: str, encoder="libx264"):
         self.id = uuid.uuid4().hex
         self.request = request
         self.executable = executable
+        self.encoder = encoder
         self.folder = root / self.id
         self.folder.mkdir()
         self.path = self.folder / "wave.mp4"
@@ -57,6 +85,8 @@ class ExportJob:
         self.logs: deque[str] = deque(maxlen=32)
         self.connected = False
         self.lock = threading.Lock()
+        self.cancelled = threading.Event()
+        self.worker: threading.Thread | None = None
 
     def snapshot(self) -> dict:
         output = self.request.output
@@ -70,6 +100,7 @@ class ExportJob:
             "eta": round((output.frame_count - self.frames) / rate, 1) if rate else None,
             "width": output.encoded_size[0], "height": output.encoded_size[1],
             "error": self.error, "error_code": self.error_code,
+            "encoder": self.encoder, "hardware_encoding": self.encoder != "libx264",
             "download_url": f"/api/exports/{self.id}/download"
             if self.status == "completed" else None,
         }
@@ -80,7 +111,7 @@ class ExportJob:
                 raise RuntimeError("이미 시작되었거나 취소한 작업입니다.")
             output = self.request.output
             w, h = output.encoded_size
-            filters = ["vflip"]  # readPixels is bottom-up; canvas JPEG is already top-down.
+            filters = ["vflip"]  # Native OpenGL readback is bottom-up.
             if (w, h) != (output.width, output.height):
                 filters += [
                     f"pad={w}:{h}:0:0",
@@ -92,9 +123,12 @@ class ExportJob:
                 "-f", "rawvideo", "-pixel_format", "rgba", "-video_size",
                 f"{output.width}x{output.height}", "-framerate", str(output.fps),
                 "-i", "pipe:0", "-an", "-vf", ",".join(filters),
-                "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+                "-c:v", self.encoder, *ENCODERS[self.encoder],
                 "-pix_fmt", "yuv420p", "-color_range", "tv", "-colorspace", "bt709",
                 "-color_primaries", "bt709", "-color_trc", "iec61966-2-1",
+                # Some hardware encoders drop codec color fields; write H.264 VUI explicitly.
+                "-bsf:v", ("h264_metadata=colour_primaries=1:transfer_characteristics=13:"
+                           "matrix_coefficients=1:video_full_range_flag=0"),
                 "-movflags", "+faststart", str(self.path),
             ]
             self.process = subprocess.Popen(
@@ -105,6 +139,44 @@ class ExportJob:
             self.stderr_thread.start()
             self.started = time.monotonic()
             self.status = "rendering"
+
+    def launch(self, renderer):
+        self.worker = threading.Thread(target=self._render, args=(renderer,), daemon=True,
+                                       name=f"xmb-export-{self.id[:8]}")
+        self.worker.start()
+
+    def _render(self, renderer):
+        pending = None
+        try:
+            self.start()
+            output = self.request.output
+
+            def frame(index):
+                return renderer.submit("render", self.request.scene, index / output.fps,
+                                       output.width, output.height, output.duration)
+
+            pending = frame(0)
+            for index in range(output.frame_count):
+                if self.cancelled.is_set():
+                    return
+                try:
+                    pixels = pending.result()
+                except Exception as exc:  # noqa: BLE001 - GPU/driver errors cross this worker boundary.
+                    self.stop(f"GPU 렌더링에 실패했습니다: {exc}", "gpu_error")
+                    return
+                if self.cancelled.is_set():
+                    return
+                # Render frame N+1 while the encoder consumes N. Never queue a whole movie.
+                pending = frame(index + 1) if index + 1 < output.frame_count else None
+                self.write(pixels)
+                self.frames = index + 1
+            if not self.cancelled.is_set():
+                self.finish()
+        except Exception as exc:  # noqa: BLE001 - A worker must always reclaim its encoder on failure.
+            self.fail(exc)
+        finally:
+            if pending:
+                pending.cancel()
 
     def _drain_stderr(self):
         assert self.process and self.process.stderr
@@ -154,6 +226,7 @@ class ExportJob:
             self.error = error
             self.error_code = code
             self.finished = time.monotonic()
+            self.cancelled.set()
         process = self.process
         if process:
             if process.poll() is None:
@@ -162,6 +235,8 @@ class ExportJob:
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 pass
+            if self.stderr_thread:
+                self.stderr_thread.join(timeout=2)
             for stream in (process.stdin, process.stderr):
                 if stream:
                     try:
@@ -181,28 +256,43 @@ class ExportJob:
 
 
 class ExportManager:
-    def __init__(self):
+    def __init__(self, renderer):
+        self.renderer = renderer
         self.root = Path(tempfile.mkdtemp(prefix="xmb-wave-"))
         self.executable, self.encoder_error = check_encoder()
         self.jobs: dict[str, ExportJob] = {}
         self.lock = threading.Lock()
+        self.default_encoder = select_encoder(
+            self.executable, 256, 256, renderer.info.get("device") or "",
+        ) if self.executable else None
+
+    @property
+    def active(self):
+        return any(job.status in ACTIVE_STATES for job in list(self.jobs.values()))
 
     def create(self, request: ExportRequest) -> ExportJob:
         if not self.executable:
             raise RuntimeError(self.encoder_error)
         with self.lock:
-            if any(job.status in ACTIVE_STATES for job in self.jobs.values()):
+            if self.active:
                 raise ValueError("다른 영상이 제작 중입니다. 완료하거나 취소한 뒤 다시 시작해 주세요.")
-            job = ExportJob(request, self.root, self.executable)
+            output = request.output
+            self.renderer.submit("allocate", output.width, output.height).result()
+            encoder = select_encoder(self.executable, *output.encoded_size,
+                                     self.renderer.info["device"], output.encoder)
+            job = ExportJob(request, self.root, self.executable, encoder)
             self.jobs[job.id] = job
             return job
 
     def expire_unconnected(self):
         for job in list(self.jobs.values()):
             if job.status == "ready" and not job.connected and time.monotonic() - job.created > 45:
-                job.stop("브라우저 렌더러가 연결되지 않아 작업을 정리했습니다.", "connection_lost")
+                job.stop("브라우저 진행 연결이 열리지 않아 작업을 정리했습니다.", "connection_lost")
 
     def close(self):
         for job in list(self.jobs.values()):
             job.stop()
+        for job in list(self.jobs.values()):
+            if job.worker:
+                job.worker.join()
         shutil.rmtree(self.root, ignore_errors=True)
